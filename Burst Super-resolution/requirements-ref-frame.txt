@@ -1,0 +1,15 @@
+# Environment used for reference_frame_sweep.py (tested on Windows 11, Python 3.14, RTX 4070 SUPER).
+# Install PyTorch with CUDA first:
+#   pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements-ref-frame.txt
+pytorch-lightning==2.6.6
+einops==0.8.2
+lpips==0.1.4
+opencv-python==5.0.0.93
+scipy==1.18.1
+numpy==2.5.4
+cupy-cuda12x[ctk]==14.2.0
+# The BurstSR meta_info.pkl files were pickled with exifread 2.x; 3.x cannot unpickle them
+ExifRead==2.3.2
+gdown==6.5.1
