@@ -1,0 +1,9 @@
+# Datasets and model weights (large, downloaded separately)
+Burst Super-resolution/burstsr_dataset/
+Burst Super-resolution/pwcnet/*.pth
+Burst Super-resolution/Trained_models/
+
+# Local environment and experiment outputs
+.venv/
+Burst Super-resolution/Results/
+__pycache__/

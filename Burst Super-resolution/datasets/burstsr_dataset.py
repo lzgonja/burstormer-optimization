@@ -5,6 +5,7 @@ import numpy as np
 import pickle as pkl
 import torch.nn.functional as F
 import random
+from typing import List
 
 
 class SamsungRAWImage:
@@ -216,7 +217,9 @@ def load_txt(path):
 
 class BurstSRDataset(torch.utils.data.Dataset):
     """ Real-world burst super-resolution dataset. """
-    def __init__(self, root, burst_size=8, crop_sz=80, center_crop=False, random_flip=False, split='train'):
+    def __init__(self, root: str, burst_size: int = 8, crop_sz: int = 80, center_crop: bool = False,
+                 random_flip: bool = False, split: str = 'train', ref_id: int = 0,
+                 shuffle_frames: bool = True) -> None:
         """
         args:
             root : path of the root directory
@@ -225,10 +228,19 @@ class BurstSRDataset(torch.utils.data.Dataset):
             center_crop: Whether to extract a random crop, or a centered crop.
             random_flip: Whether to apply random horizontal and vertical flip
             split: Can be 'train' or 'val'
+            ref_id: Index (0-13) of the raw frame to use as the reference. The network always treats
+                    position 0 of the burst as the reference, so this frame is placed first.
+            shuffle_frames: If True (original behaviour), the non-reference frames are randomly sampled and
+                    ordered. If False, the first burst_size-1 non-reference frames are used in capture order,
+                    which makes evaluation deterministic (the network's burst pooling is order-sensitive).
         """
         assert burst_size <= 14, 'burst_sz must be less than or equal to 14'
         assert crop_sz <= 80, 'crop_sz must be less than or equal to 80'
         assert split in ['train', 'val']
+        assert 0 <= ref_id < 14, 'ref_id must be in [0, 13]'
+
+        self.ref_id = ref_id
+        self.shuffle_frames = shuffle_frames
 
         root = root + '/' + split
         super().__init__()
@@ -272,11 +284,17 @@ class BurstSRDataset(torch.utils.data.Dataset):
 
         return frames, gt, info
 
-    def _sample_images(self):
+    def _sample_images(self) -> List[int]:
         burst_size = 14
 
-        ids = random.sample(range(1, burst_size), k=self.burst_size - 1)
-        ids = [0, ] + ids
+        # Sample the non-reference frames from every frame except the chosen reference
+        others = [i for i in range(burst_size) if i != self.ref_id]
+        if self.shuffle_frames:
+            ids = random.sample(others, k=self.burst_size - 1)
+        else:
+            ids = others[:self.burst_size - 1]
+        # Reference frame goes first: the network and the aligned metrics use index 0 as the reference
+        ids = [self.ref_id, ] + ids
         return ids
 
     def __len__(self):

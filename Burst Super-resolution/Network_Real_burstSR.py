@@ -419,7 +419,6 @@ class Base_Model(pl.LightningModule):
         burst_feat = self.up3(burst_feat) 
         burst_feat = self.out_conv(burst_feat)
 
-        output = torchvision.transforms.functional.adjust_sharpness(output, sharpness_factor=10)
         
         return burst_feat
 

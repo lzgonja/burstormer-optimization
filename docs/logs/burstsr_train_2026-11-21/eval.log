@@ -1,0 +1,40 @@
+W1121 12:37:57.081000 36132 Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+Seed set to 13
+C:\Users\Stanley Cao\Desktop\burstormer-optimization\.venv\Lib\site-packages\torchvision\models\_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+C:\Users\Stanley Cao\Desktop\burstormer-optimization\.venv\Lib\site-packages\torchvision\models\_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=AlexNet_Weights.IMAGENET1K_V1`. You can also use `weights=AlexNet_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+W1121 12:38:04.364000 35784 Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+W1121 12:38:04.376000 34976 Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+Seed set to 13
+Seed set to 13
+C:\Users\Stanley Cao\Desktop\burstormer-optimization\.venv\Lib\site-packages\torch\functional.py:505: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\aten\src\ATen\native\TensorShape.cpp:4383.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+[1/882] 9.26s/burst, ETA 135.9 min
+[50/882] 1.97s/burst, ETA 27.4 min
+[100/882] 1.91s/burst, ETA 24.9 min
+[150/882] 1.88s/burst, ETA 22.9 min
+[200/882] 1.88s/burst, ETA 21.3 min
+[250/882] 1.87s/burst, ETA 19.7 min
+[300/882] 1.86s/burst, ETA 18.0 min
+[350/882] 1.85s/burst, ETA 16.4 min
+[400/882] 1.85s/burst, ETA 14.9 min
+[450/882] 1.85s/burst, ETA 13.3 min
+[500/882] 1.85s/burst, ETA 11.8 min
+[550/882] 1.85s/burst, ETA 10.2 min
+[600/882] 1.85s/burst, ETA 8.7 min
+[650/882] 1.84s/burst, ETA 7.1 min
+[700/882] 1.84s/burst, ETA 5.6 min
+[750/882] 1.84s/burst, ETA 4.0 min
+[800/882] 1.84s/burst, ETA 2.5 min
+[850/882] 1.84s/burst, ETA 1.0 min
+
+882 bursts, 23 scenes. PSNR differences are paired, 95% interval over scenes.
+model             PSNR    SSIM   LPIPS  PSNR vs bilinear        PSNR vs downloaded
+bilinear         42.25  0.9557  0.2135                          +11.04 [+9.90, +11.94]
+downloaded       31.20  0.8493  0.2565  -11.04 [-11.94, -9.90]  
+calibrated       47.70  0.9849  0.0483  +5.45 [+5.00, +5.84]    +16.50 [+15.38, +17.49]
+best             47.97  0.9853  0.0507  +5.72 [+5.38, +6.03]    +16.76 [+15.53, +17.84]
+final            46.47  0.9812  0.0623  +4.23 [+3.91, +4.49]    +15.27 [+14.16, +16.23]
+
+Wrote ./Results/Real/burstsr_train_eval/per_burst.csv and summary.csv
