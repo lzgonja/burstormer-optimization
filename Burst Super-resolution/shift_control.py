@@ -15,6 +15,11 @@ output and every shifted copy. Two probes split the penalty: O_0 shifted by half
 and by a whole number of pixels (flow and framing only). For the probes, input frame 0 is moved by the same amount
 (at raw scale), because the metric colour-matches with it and it must stay in register with the output.
 
+--reverse_check estimates the corrected gain a second, independent way: move each real output O_k back to frame 0's
+position and score it as reference 0, so frame k's own reconstruction is scored without its position. If the
+penalty depends only on position, both estimates agree (docs/SHIFT_CONTROL_VALIDATION.md). With this option every
+score also uses the pixels the moved-back outputs cover, so the common region is slightly smaller.
+
 Example:
     python shift_control.py --weights ./Trained_models/Real/burstormer_burstsr_train.pth \
         --bursts_file ./splits/dev.txt --limit 40 --out_dir ./Results/Real/shift_control_dev
@@ -90,6 +95,8 @@ def main() -> None:
     parser.add_argument('--refs', default=5, type=int, help='References 0..refs-1')
     parser.add_argument('--bursts_file', default=None, type=str)
     parser.add_argument('--limit', default=None, type=int)
+    parser.add_argument('--reverse_check', action='store_true',
+                        help='Also move each O_k back to frame 0 and score it as reference 0 (second estimate)')
     args = parser.parse_args()
 
     set_seed(50)
@@ -104,7 +111,7 @@ def main() -> None:
     rows: List[Dict] = []
     path = os.path.join(args.out_dir, 'per_burst.csv')
     fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'psnr_real', 'psnr_shifted', 'penalty', 'gain_real',
-              'gain_corrected', 'shifted_vs_real_psnr', 'common_frac']
+              'gain_corrected', 'shifted_vs_real_psnr', 'common_frac'] + (['gain_reverse'] if args.reverse_check else [])
     with open(path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -126,7 +133,10 @@ def main() -> None:
                 moved = burst.clone()
                 moved[0, 0] = shift_image(burst[:, 0], dy / 8, dx / 8)[0]
                 probe_al[p] = metrics.align_patches(shift_image(outputs[0], dy, dx), gt, moved)
-            all_al = list(real_al.values()) + list(shift_al.values()) + list(probe_al.values())
+            # Second estimate: frame k's own output moved back to frame 0's position, scored as reference 0
+            back_al = {k: metrics.align_patches(shift_image(outputs[k], *(-shifts[k]).tolist()), gt, burst)
+                       for k in refs[1:]} if args.reverse_check else {}
+            all_al = list(real_al.values()) + list(shift_al.values()) + list(probe_al.values()) + list(back_al.values())
             n_patches = len(real_al[0])
             common = [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in all_al]).all(dim=0)
                       for p in range(n_patches)]
@@ -146,6 +156,8 @@ def main() -> None:
                        'psnr_real': real[k], 'psnr_shifted': shift[k], 'penalty': real[0] - shift[k],
                        'gain_real': real[k] - real[0], 'gain_corrected': real[k] - real[0] + (real[0] - shift[k]),
                        'shifted_vs_real_psnr': -10 * math.log10(mse + 1e-12), 'common_frac': common_frac}
+                if args.reverse_check:
+                    row['gain_reverse'] = 0.0 if k == 0 else psnr(back_al[k]) - real[0]
                 rows.append(row)
                 writer.writerow(row)
             for p in PROBES:
@@ -181,6 +193,19 @@ def main() -> None:
         pen = np.array([r['penalty'] for r in by_ref[p]])
         summary.append({'ref': p, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen)})
         print(f'{p:>14}{math.hypot(*PROBES[p]):>10.1f}{"":>12}{pen.mean():>+9.3f}{"[%+.3f, %+.3f]" % tuple(bootstrap(pen)):>18}')
+
+    if args.reverse_check:
+        print('\nReverse check: corrected gain estimated two ways (95% bootstrap over bursts)')
+        print(f'{"ref":>6}{"O_0 moved to k":>16}{"O_k moved to 0":>16}{"difference":>12}{"interval":>18}{"per-burst r":>13}')
+        for k in refs[1:]:
+            sel = by_ref[k]
+            a = np.array([r['gain_corrected'] for r in sel])
+            b = np.array([r['gain_reverse'] for r in sel])
+            r_ = float(np.corrcoef(a, b)[0, 1])
+            summary.append({'ref': f'reverse_{k}', 'gain_corrected': a.mean(), 'gain_reverse': b.mean(),
+                            'difference': (b - a).mean(), 'difference_ci': bootstrap(b - a), 'per_burst_r': r_})
+            print(f'{k:>6}{a.mean():>+16.3f}{b.mean():>+16.3f}{(b - a).mean():>+12.3f}'
+                  f'{"[%+.3f, %+.3f]" % tuple(bootstrap(b - a)):>18}{r_:>13.2f}')
 
     # Oracle per burst, before and after the correction
     bursts = sorted({r['burst'] for r in rows})
