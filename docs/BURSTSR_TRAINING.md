@@ -3,6 +3,11 @@
 Run of 2026-11-20 to 2026-11-21. Ticket: T02, last task ("download the BurstSR train set for a model comparable to
 the paper"). Raw logs: [logs/burstsr_train_2026-11-21/](logs/burstsr_train_2026-11-21/).
 
+**Weights:** `burstormer_burstsr_train.pth` (step 10,000, 13 MB) is attached to the GitHub release
+[t02-burstsr-v1](https://github.com/lzgonja/burstormer-optimization/releases/tag/t02-burstsr-v1). Put it in
+`Burst Super-resolution/Trained_models/Real/`. SHA-256:
+`a9fea90f0456d87cdf988df757f654da020da1915a74940ff66d26697d069a53`.
+
 ## Setup
 
 | | |
