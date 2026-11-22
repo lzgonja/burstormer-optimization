@@ -1,7 +1,8 @@
 # Shift control: does the metric favour frame 0?
 
-Script: `Burst Super-resolution/shift_control.py`. Run of 2026-11-21. Raw results:
-[logs/shift_control_2026-11-21/](logs/shift_control_2026-11-21/).
+Script: `Burst Super-resolution/shift_control.py`. Run of 2026-11-21. Raw results and work log:
+[logs/shift_control_2026-11-21/](logs/shift_control_2026-11-21/) ([LOG.md](logs/shift_control_2026-11-21/LOG.md)).
+Why the correction can be trusted: [SHIFT_CONTROL_VALIDATION.md](SHIFT_CONTROL_VALIDATION.md).
 
 ## What it is
 
@@ -46,6 +47,9 @@ following files:
 From `Burst Super-resolution/`:
 
 ```
+# Unit tests of the shift operations (CPU, seconds)
+python -m unittest tests.test_shift_control -v
+
 # Quick check: 2 bursts
 python shift_control.py --bursts_file ./splits/dev.txt --limit 2 --out_dir ./Results/Real/shift_control_smoke
 
@@ -59,6 +63,8 @@ Options:
 - `--refs N`: test references 0 to N-1 (default 5).
 - `--bursts_file`: a list of burst names, for example the scene splits in `./splits/`.
 - `--limit N`: use N bursts spread across the scenes.
+- `--reverse_check`: also estimate the corrected gain the other way round. Each frame-k output is moved back to
+  frame 0's position and scored as frame 0 (column `gain_reverse`, plus an agreement table). About 40% slower.
 
 Outputs in `--out_dir`:
 - **`per_burst.csv`**: one row per burst and reference frame. Columns:
@@ -102,10 +108,14 @@ with 95% bootstrap intervals over bursts.
 What this shows:
 - **The metric charges a penalty for position.** It grows with the shift: up to 0.44 dB for frame 4 on dev.
 - **The penalty comes from the displacement, not from resampling.** A half-pixel shift costs nothing.
-- **Corrected, frames 1-4 are each better references than frame 0 on the test scenes.** All intervals are above
-  zero. Frame 0 is the best frame in only 3 of 40 test bursts.
-- **The real headroom for choosing the reference is larger than the standard metric shows:** +0.23 dB on test.
-  The per-burst oracle includes some selection noise.
+- **Corrected, frames 3 and 4 are better references than frame 0 on the test scenes, by 0.07-0.12 dB.** This
+  holds under both estimates. Frames 1 and 2 beat frame 0 under this estimate (+0.06 and +0.07 dB), but the
+  reverse check gives about half that, with intervals that include zero. Frame 0 is the best frame in only 3-4 of
+  40 test bursts.
+- **The real headroom for choosing the reference is larger than the standard metric shows:** +0.20 to +0.23 dB
+  on test, against +0.13. The per-burst oracle includes some selection noise.
+- **Read corrected gains as accurate to about +/-0.05 dB.** That is how far the two estimates differ on average
+  (see the validation document).
 
 ## Limits
 
