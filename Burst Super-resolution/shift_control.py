@@ -1,28 +1,38 @@
 """Shift control: how much does the BurstSR metric penalise a reference frame just for its position?
 
 The ground truth is registered to frame 0. An output made with frame k as reference is displaced from it, so the
-metric must warp it further (bilinear resampling, larger optical flow). This script separates that penalty from real
-reconstruction quality:
+metric must warp it further (optical flow over a larger displacement, content near the patch edges). This script
+separates that penalty from real reconstruction quality:
 
     1. Run the model with references 0..K-1 (outputs O_0 ... O_k).
-    2. Measure the translation from O_0 to each O_k by phase correlation at output resolution.
-    3. Build S_k = O_0 moved by that translation (mirror padding, then an exact Fourier shift: no blur, no ringing).
-    4. Score S_k exactly as O_k is scored (burst reordered to reference k, same metric, same pixels).
+    2. Estimate the geometry between O_0 and each O_k (--geometry: a translation, an affine map, a homography, or
+       dense optical flow; see shift_geometry.py). Images are moved with an exact Fourier shift plus 8x band-limited
+       resampling of the rest, which keeps detail and noise level (tests/test_shift_geometry.py).
+    3. Reverse estimate (the default, --estimator reverse): move O_k back to frame 0's position and score it as
+       reference 0. Frame k's own reconstruction is then scored without its position, so
+           corrected gain = PSNR(O_k moved to frame 0, as ref 0) - PSNR(O_0, as ref 0).
+    4. Forward estimate (the original control): move O_0 to frame k's position and score it as reference k. Its loss
+       is the penalty for position, measured on frame 0's content, and is added back to frame k's real gain:
+           corrected gain = PSNR(O_k, as ref k) - PSNR(O_0 moved to frame k, as ref k).
 
-S_k has the same content as O_0, so PSNR(O_0) - PSNR(S_k) is the metric's penalty for position alone. The corrected
-gain of frame k is PSNR(O_k) - PSNR(O_0) + penalty_k. All scores use the pixels valid and in view for every real
-output and every shifted copy. Two probes split the penalty: O_0 shifted by half an output pixel (resampling only)
-and by a whole number of pixels (flow and framing only). For the probes, input frame 0 is moved by the same amount
-(at raw scale), because the metric colour-matches with it and it must stay in register with the output.
+Which estimate is right was measured with known answers (shift_control_benchmark.py,
+docs/SHIFT_CONTROL_VALIDATION.md). The reverse estimate is unbiased and accurate to about 0.03 dB RMS. The forward
+estimate is biased when frame k's content differs from frame 0's (0.28 dB RMS), because the penalty depends on the
+content being moved. Both are always computed. `penalty` is corrected gain minus measured gain.
 
---reverse_check estimates the corrected gain a second, independent way: move each real output O_k back to frame 0's
-position and score it as reference 0, so frame k's own reconstruction is scored without its position. If the
-penalty depends only on position, both estimates agree (docs/SHIFT_CONTROL_VALIDATION.md). With this option every
-score also uses the pixels the moved-back outputs cover, so the common region is slightly smaller.
+Region (--region): `pair` scores frame k and frame 0 on the pixels valid and in view for every image of that
+comparison, so a frame's result does not depend on which other frames are in the run. `all` uses the pixels common
+to every image of the burst, as the original control did.
+
+Two probes check the metric itself: O_0 moved by half an output pixel (resampling only) and by 8 x 8 output pixels
+(displacement only). For the probes, input frame 0 is moved by the same amount (at raw scale), because the metric
+colour-matches with it and it must stay in register with the output.
+
+The original control is `--geometry translation --region all --estimator forward` (with the warp now unclipped,
+it reproduces the 2026-11-22 numbers to within 0.012 dB).
 
 Example:
-    python shift_control.py --weights ./Trained_models/Real/burstormer_burstsr_train.pth \
-        --bursts_file ./splits/dev.txt --limit 40 --out_dir ./Results/Real/shift_control_dev
+    python shift_control.py --bursts_file ./splits/dev.txt --limit 40 --refs 14 --out_dir ./Results/Real/sc_dev
 """
 
 import argparse
@@ -38,53 +48,22 @@ import torch.nn.functional as F
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
+from shift_geometry import (MODELS, PAD, Geometry, estimate_geometry, shift_image,  # noqa: F401 (PAD: tests)
+                            translation, warp_image)
 
-PAD = 64  # minimum mirror padding (output pixels) around a shifted image; grown for larger shifts
 PROBES = {'probe_half_px': (0.5, 0.5), 'probe_whole_px': (8.0, 8.0)}
-
-
-def translation(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Sub-pixel (dy, dx) that moves image a onto image b, by phase correlation of the green channels. [1, 3, H, W]."""
-    ga, gb = a[0, 1] - a[0, 1].mean(), b[0, 1] - b[0, 1].mean()
-    h, w = ga.shape
-    window = torch.hann_window(h, periodic=False, device=a.device)[:, None] * \
-        torch.hann_window(w, periodic=False, device=a.device)[None, :]
-    fa, fb = torch.fft.fft2(ga * window), torch.fft.fft2(gb * window)
-    cross = fb * fa.conj()
-    corr = torch.fft.ifft2(cross / (cross.abs() + 1e-12)).real  # peaks at the displacement of b relative to a
-    peak = int(corr.argmax())
-    py, px = peak // w, peak % w
-
-    def refine(cm: float, c0: float, cp: float) -> float:
-        d = cm - 2 * c0 + cp
-        return 0.0 if abs(d) < 1e-12 else max(-0.5, min(0.5, 0.5 * (cm - cp) / d))
-
-    dy = py + refine(corr[(py - 1) % h, px].item(), corr[py, px].item(), corr[(py + 1) % h, px].item())
-    dx = px + refine(corr[py, (px - 1) % w].item(), corr[py, px].item(), corr[py, (px + 1) % w].item())
-    dy = dy - h if dy > h / 2 else dy
-    dx = dx - w if dx > w / 2 else dx
-    return torch.tensor([dy, dx])
-
-
-def shift_image(img: torch.Tensor, dy: float, dx: float) -> torch.Tensor:
-    """Move img [1, C, H, W] by (dy, dx) output pixels: mirror-pad, exact Fourier shift, crop back."""
-    h, w = img.shape[-2:]
-    pad = max(PAD, int(math.ceil(max(abs(dy), abs(dx)))) + 4)  # later frames (e.g. 13) can shift ~64 px
-    if pad >= min(h, w):
-        raise ValueError(f'Shift ({dy:.1f}, {dx:.1f}) is too large for a {h}x{w} image')
-    padded = F.pad(img, [pad] * 4, mode='reflect')
-    hp, wp = padded.shape[-2:]
-    fy = torch.fft.fftfreq(hp, device=img.device)[:, None]
-    fx = torch.fft.fftfreq(wp, device=img.device)[None, :]
-    ramp = torch.exp(-2j * math.pi * (fy * dy + fx * dx))
-    shifted = torch.fft.ifft2(torch.fft.fft2(padded) * ramp).real
-    return shifted[..., pad:pad + h, pad:pad + w].clamp(0.0, 1.0)
 
 
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
     rng = np.random.default_rng(seed)
     means = x[rng.integers(0, len(x), (n, len(x)))].mean(axis=1)
     return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
+
+
+def fidelity(a: torch.Tensor, b: torch.Tensor, margin: int) -> float:
+    """PSNR between two outputs away from the edges: how well a moved output matches the one it was moved onto."""
+    crop = (Ellipsis, slice(margin, -margin), slice(margin, -margin))
+    return -10 * math.log10(F.mse_loss(a[crop], b[crop]).item() + 1e-12)
 
 
 def main() -> None:
@@ -96,13 +75,21 @@ def main() -> None:
     parser.add_argument('--refs', default=5, type=int, help='References 0..refs-1')
     parser.add_argument('--bursts_file', default=None, type=str)
     parser.add_argument('--limit', default=None, type=int)
-    parser.add_argument('--reverse_check', action='store_true',
-                        help='Also move each O_k back to frame 0 and score it as reference 0 (second estimate)')
+    parser.add_argument('--geometry', default='homography', choices=MODELS,
+                        help='How an output is moved to the position of another frame (see shift_geometry.py)')
+    parser.add_argument('--estimator', default='reverse', choices=('reverse', 'forward'),
+                        help='Which estimate is reported as gain_corrected (both are always computed)')
+    parser.add_argument('--region', default='pair', choices=('pair', 'all'),
+                        help='pair: score frame k and frame 0 on the pixels common to that comparison; '
+                             'all: on the pixels common to every image of the burst')
+    parser.add_argument('--factor', default=8, type=int, help='Upsampling factor of the warp (non-translation)')
+    parser.add_argument('--reverse_check', action='store_true', help='No effect: both estimates are always computed')
     args = parser.parse_args()
 
     set_seed(50)
     os.makedirs(args.out_dir, exist_ok=True)
-    metrics = FastAlignedMetrics(PWCNet(load_pretrained=True, weights_path=args.pwcnet).cuda())
+    flow_net = PWCNet(load_pretrained=True, weights_path=args.pwcnet).cuda()
+    metrics = FastAlignedMetrics(flow_net)
     model = load_model(args.weights)
     dataset = BurstSRDataset(root=args.data_root, split='val', burst_size=NUM_FRAMES, crop_sz=80,
                              random_flip=False, ref_id=0, shuffle_frames=False)
@@ -111,8 +98,9 @@ def main() -> None:
 
     rows: List[Dict] = []
     path = os.path.join(args.out_dir, 'per_burst.csv')
-    fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'psnr_real', 'psnr_shifted', 'penalty', 'gain_real',
-              'gain_corrected', 'shifted_vs_real_psnr', 'common_frac'] + (['gain_reverse'] if args.reverse_check else [])
+    fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'residual_max_px', 'psnr_frame0', 'psnr_real', 'psnr_forward',
+              'psnr_reverse', 'gain_real', 'gain_forward', 'gain_reverse', 'gain_corrected', 'penalty',
+              'fidelity_forward', 'fidelity_reverse', 'common_frac']
     with open(path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -121,100 +109,129 @@ def main() -> None:
             burst, gt = burst[None].cuda(), gt[None].cuda()
             with torch.no_grad():
                 outputs = {k: model(reorder(burst, k)).clamp(0.0, 1.0) for k in refs}
-            shifts = {k: translation(outputs[0], outputs[k]) for k in refs}
-            shifts[0] = torch.zeros(2)
-            shifted = {k: shift_image(outputs[0], *shifts[k].tolist()) for k in refs}
-            shifted[0] = outputs[0]
+            o0 = outputs[0]
+            fwd_geo, rev_geo, fwd_img, rev_img = {}, {}, {}, {}
+            for k in refs[1:]:
+                fwd_geo[k] = estimate_geometry(o0, outputs[k], args.geometry, flow_net)
+                # Moving O_k back: estimated in that direction (for a translation, the forward shift reversed)
+                rev_geo[k] = Geometry(-fwd_geo[k].shift) if args.geometry == 'translation' else \
+                    estimate_geometry(outputs[k], o0, args.geometry, flow_net)
+                fwd_img[k] = warp_image(o0, fwd_geo[k], args.factor)
+                rev_img[k] = warp_image(outputs[k], rev_geo[k], args.factor)
 
-            # Align every image once; real and shifted outputs of frame k are both scored as reference k
+            # Align every image once. Images at frame k's position are scored with the burst reordered to k
             real_al = {k: metrics.align_patches(outputs[k], gt, reorder(burst, k)) for k in refs}
-            shift_al = {k: metrics.align_patches(shifted[k], gt, reorder(burst, k)) for k in refs}
+            fwd_al = {k: metrics.align_patches(fwd_img[k], gt, reorder(burst, k)) for k in refs[1:]}
+            rev_al = {k: metrics.align_patches(rev_img[k], gt, burst) for k in refs[1:]}
             probe_al = {}
             for p, (dy, dx) in PROBES.items():
                 moved = burst.clone()
                 moved[0, 0] = shift_image(burst[:, 0], dy / 8, dx / 8)[0]
-                probe_al[p] = metrics.align_patches(shift_image(outputs[0], dy, dx), gt, moved)
-            # Second estimate: frame k's own output moved back to frame 0's position, scored as reference 0
-            back_al = {k: metrics.align_patches(shift_image(outputs[k], *(-shifts[k]).tolist()), gt, burst)
-                       for k in refs[1:]} if args.reverse_check else {}
-            all_al = list(real_al.values()) + list(shift_al.values()) + list(probe_al.values()) + list(back_al.values())
+                probe_al[p] = metrics.align_patches(shift_image(o0, dy, dx), gt, moved)
             n_patches = len(real_al[0])
-            common = [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in all_al]).all(dim=0)
-                      for p in range(n_patches)]
-            common_frac = float(np.mean([c.float().mean().item() for c in common]))
 
-            def psnr(al):
-                return metrics.score(al, regions=common)[0]
+            def region(als):
+                return [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in als]).all(dim=0)
+                        for p in range(n_patches)]
 
-            real = {k: psnr(real_al[k]) for k in refs}
-            shift = {k: psnr(shift_al[k]) for k in refs}
+            common = region(list(real_al.values()) + list(fwd_al.values()) + list(rev_al.values()) +
+                            list(probe_al.values()))
+            regions = {}
+            for k in refs + list(PROBES):
+                if args.region == 'all':
+                    regions[k] = common
+                elif k in PROBES:
+                    regions[k] = region([real_al[0], probe_al[k]])
+                elif k == 0:
+                    regions[k] = region([real_al[0]])
+                else:
+                    regions[k] = region([real_al[0], real_al[k], fwd_al[k], rev_al[k]])
+
+            def psnr(al, k):
+                return metrics.score(al, regions=regions[k])[0]
+
             for k in refs:
-                # How close a pure translation of O_0 is to the real O_k (on the pixels both cover)
-                margin = int(math.ceil(shifts[k].abs().max().item())) + 8
-                crop = (Ellipsis, slice(margin, -margin), slice(margin, -margin))
-                mse = F.mse_loss(shifted[k][crop], outputs[k][crop]).item()
-                row = {'burst': name, 'ref': k, 'shift_dy': shifts[k][0].item(), 'shift_dx': shifts[k][1].item(),
-                       'psnr_real': real[k], 'psnr_shifted': shift[k], 'penalty': real[0] - shift[k],
-                       'gain_real': real[k] - real[0], 'gain_corrected': real[k] - real[0] + (real[0] - shift[k]),
-                       'shifted_vs_real_psnr': -10 * math.log10(mse + 1e-12), 'common_frac': common_frac}
-                if args.reverse_check:
-                    row['gain_reverse'] = 0.0 if k == 0 else psnr(back_al[k]) - real[0]
+                frac = float(np.mean([c.float().mean().item() for c in regions[k]]))
+                p0, pk = psnr(real_al[0], k), psnr(real_al[k], k)
+                row = {'burst': name, 'ref': k, 'psnr_frame0': p0, 'psnr_real': pk, 'gain_real': pk - p0,
+                       'common_frac': frac}
+                if k == 0:
+                    row.update({'shift_dy': 0.0, 'shift_dx': 0.0, 'residual_max_px': 0.0, 'psnr_forward': p0,
+                                'psnr_reverse': p0, 'gain_forward': 0.0, 'gain_reverse': 0.0})
+                else:
+                    pf, pr = psnr(fwd_al[k], k), psnr(rev_al[k], k)
+                    margin = int(math.ceil(fwd_geo[k].shift.abs().max().item() + fwd_geo[k].max_residual())) + 8
+                    row.update({'shift_dy': fwd_geo[k].shift[0].item(), 'shift_dx': fwd_geo[k].shift[1].item(),
+                                'residual_max_px': fwd_geo[k].max_residual(), 'psnr_forward': pf, 'psnr_reverse': pr,
+                                'gain_forward': pk - pf, 'gain_reverse': pr - p0,
+                                'fidelity_forward': fidelity(fwd_img[k], outputs[k], margin),
+                                'fidelity_reverse': fidelity(rev_img[k], o0, margin)})
+                row['gain_corrected'] = row[f'gain_{args.estimator}']
+                row['penalty'] = row['gain_corrected'] - row['gain_real']
                 rows.append(row)
                 writer.writerow(row)
             for p in PROBES:
-                row = {'burst': name, 'ref': p, 'psnr_real': real[0], 'psnr_shifted': psnr(probe_al[p]),
-                       'penalty': real[0] - psnr(probe_al[p]), 'common_frac': common_frac}
+                p0 = psnr(real_al[0], p)
+                row = {'burst': name, 'ref': p, 'psnr_frame0': p0, 'psnr_forward': psnr(probe_al[p], p),
+                       'penalty': p0 - psnr(probe_al[p], p),
+                       'common_frac': float(np.mean([c.float().mean().item() for c in regions[p]]))}
                 rows.append(row)
                 writer.writerow(row)
             f.flush()
             print(f'[{n_done + 1}/{len(indices)}] {name}', flush=True)
 
-    # Summary
+    summarise(rows, refs, args, path)
+
+
+def summarise(rows: List[Dict], refs: List[int], args, path: str) -> None:
     by_ref = {k: [r for r in rows if r['ref'] == k] for k in refs + list(PROBES)}
-    print(f'\n{len(indices)} bursts, PSNR on the region common to every image ({np.mean([r["common_frac"] for r in rows]):.0%} '
-          f'of pixels). Penalty = PSNR(O_0) - PSNR(O_0 moved to frame k). 95% bootstrap over bursts.')
-    print(f'{"ref":>14}{"shift px":>10}{"O_k~S_k dB":>12}{"penalty":>9}{"interval":>18}{"real gain":>11}{"interval":>18}'
+    n_bursts = len(by_ref[0])
+    region_text = 'common to every image' if args.region == 'all' else 'common to each comparison'
+    print(f'\n{n_bursts} bursts. Geometry {args.geometry}, {args.estimator} estimate, PSNR on the pixels '
+          f'{region_text} ({np.mean([r["common_frac"] for r in rows]):.0%}). Penalty = corrected - measured gain. '
+          f'95% bootstrap over bursts.')
+    print(f'{"ref":>14}{"shift px":>10}{"fidelity":>10}{"penalty":>9}{"interval":>18}{"measured":>10}{"interval":>18}'
           f'{"corrected":>11}{"interval":>18}')
     summary = []
     for k in refs:
         sel = by_ref[k]
-        pen = np.array([r['penalty'] for r in sel])
-        gr = np.array([r['gain_real'] for r in sel])
-        gc = np.array([r['gain_corrected'] for r in sel])
+        pen, gr, gc = (np.array([r[c] for r in sel]) for c in ('penalty', 'gain_real', 'gain_corrected'))
         sh = np.mean([math.hypot(r['shift_dy'], r['shift_dx']) for r in sel])
-        sim = np.mean([r['shifted_vs_real_psnr'] for r in sel if k != 0]) if k else float('nan')
-        summary.append({'ref': k, 'mean_shift_px': sh, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen),
-                        'gain_real': gr.mean(), 'gain_real_ci': bootstrap(gr), 'gain_corrected': gc.mean(),
-                        'gain_corrected_ci': bootstrap(gc), 'shifted_vs_real_psnr': sim})
-        s = summary[-1]
-        print(f'{k:>14}{sh:>10.1f}{sim:>12.1f}{s["penalty"]:>+9.3f}{"[%+.3f, %+.3f]" % tuple(s["penalty_ci"]):>18}'
-              f'{s["gain_real"]:>+11.3f}{"[%+.3f, %+.3f]" % tuple(s["gain_real_ci"]):>18}'
+        fid = np.mean([r[f'fidelity_{args.estimator}'] for r in sel]) if k else float('nan')
+        s = {'ref': k, 'mean_shift_px': sh, 'fidelity': fid, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen),
+             'gain_real': gr.mean(), 'gain_real_ci': bootstrap(gr), 'gain_corrected': gc.mean(),
+             'gain_corrected_ci': bootstrap(gc)}
+        if k:
+            gf = np.array([r['gain_forward'] for r in sel])
+            gv = np.array([r['gain_reverse'] for r in sel])
+            s.update({'gain_forward': gf.mean(), 'gain_reverse': gv.mean(), 'reverse_minus_forward': (gv - gf).mean(),
+                      'reverse_minus_forward_ci': bootstrap(gv - gf),
+                      'per_burst_r': float(np.corrcoef(gf, gv)[0, 1]) if len(sel) > 2 else float('nan')})
+        summary.append(s)
+        print(f'{k:>14}{sh:>10.1f}{fid:>10.1f}{s["penalty"]:>+9.3f}{"[%+.3f, %+.3f]" % tuple(s["penalty_ci"]):>18}'
+              f'{s["gain_real"]:>+10.3f}{"[%+.3f, %+.3f]" % tuple(s["gain_real_ci"]):>18}'
               f'{s["gain_corrected"]:>+11.3f}{"[%+.3f, %+.3f]" % tuple(s["gain_corrected_ci"]):>18}')
     for p in PROBES:
         pen = np.array([r['penalty'] for r in by_ref[p]])
         summary.append({'ref': p, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen)})
-        print(f'{p:>14}{math.hypot(*PROBES[p]):>10.1f}{"":>12}{pen.mean():>+9.3f}{"[%+.3f, %+.3f]" % tuple(bootstrap(pen)):>18}')
+        print(f'{p:>14}{math.hypot(*PROBES[p]):>10.1f}{"":>10}{pen.mean():>+9.3f}'
+              f'{"[%+.3f, %+.3f]" % tuple(bootstrap(pen)):>18}')
 
-    if args.reverse_check:
-        print('\nReverse check: corrected gain estimated two ways (95% bootstrap over bursts)')
-        print(f'{"ref":>6}{"O_0 moved to k":>16}{"O_k moved to 0":>16}{"difference":>12}{"interval":>18}{"per-burst r":>13}')
-        for k in refs[1:]:
-            sel = by_ref[k]
-            a = np.array([r['gain_corrected'] for r in sel])
-            b = np.array([r['gain_reverse'] for r in sel])
-            r_ = float(np.corrcoef(a, b)[0, 1])
-            summary.append({'ref': f'reverse_{k}', 'gain_corrected': a.mean(), 'gain_reverse': b.mean(),
-                            'difference': (b - a).mean(), 'difference_ci': bootstrap(b - a), 'per_burst_r': r_})
-            print(f'{k:>6}{a.mean():>+16.3f}{b.mean():>+16.3f}{(b - a).mean():>+12.3f}'
-                  f'{"[%+.3f, %+.3f]" % tuple(bootstrap(b - a)):>18}{r_:>13.2f}')
+    print('\nForward vs reverse estimate of the corrected gain (diagnostic; the benchmark favours reverse)')
+    print(f'{"ref":>6}{"forward":>10}{"reverse":>10}{"difference":>12}{"interval":>18}{"per-burst r":>13}')
+    for s in summary:
+        if isinstance(s['ref'], int) and s['ref'] > 0:
+            print(f'{s["ref"]:>6}{s["gain_forward"]:>+10.3f}{s["gain_reverse"]:>+10.3f}'
+                  f'{s["reverse_minus_forward"]:>+12.3f}{"[%+.3f, %+.3f]" % tuple(s["reverse_minus_forward_ci"]):>18}'
+                  f'{s["per_burst_r"]:>13.2f}')
 
-    # Oracle per burst, before and after the correction
     bursts = sorted({r['burst'] for r in rows})
     per = {(r['burst'], r['ref']): r for r in rows if r['ref'] in refs}
     oracle_real = np.array([max(per[(b, k)]['gain_real'] for k in refs) for b in bursts])
     oracle_corr = np.array([max(per[(b, k)]['gain_corrected'] for k in refs) for b in bursts])
-    print(f'\nOracle gain over frame 0: measured {oracle_real.mean():+.3f} {bootstrap(oracle_real)}, '
-          f'corrected {oracle_corr.mean():+.3f} {bootstrap(oracle_corr)}')
+    print(f'\nBest frame per burst, gain over frame 0: measured {oracle_real.mean():+.3f} '
+          f'[{bootstrap(oracle_real)[0]:+.3f}, {bootstrap(oracle_real)[1]:+.3f}], corrected {oracle_corr.mean():+.3f} '
+          f'[{bootstrap(oracle_corr)[0]:+.3f}, {bootstrap(oracle_corr)[1]:+.3f}]')
     best = [max(refs, key=lambda k: per[(b, k)]['gain_corrected']) for b in bursts]
     print('Best frame after correction (frame:bursts): ' + ' '.join(f'{k}:{best.count(k)}' for k in refs))
 
