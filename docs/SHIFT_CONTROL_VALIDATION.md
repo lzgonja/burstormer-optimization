@@ -119,7 +119,7 @@ the patch edges, not resampling.
   decimals.
 - **The script also ran from the `shift-control` branch alone,** with only code from `main`, and reproduced the
   smoke-test numbers to within 0.01 dB.
-- **The 9 unit tests pass:** `python -m unittest tests.test_shift_control -v`.
+- **The 10 unit tests pass:** `python -m unittest tests.test_shift_control -v`.
 
 ## What can be claimed
 

@@ -61,9 +61,17 @@ class TestShiftImage(unittest.TestCase):
         grad = lambda x: (x[..., 1:, :] - x[..., :-1, :]).pow(2).mean().item()
         self.assertAlmostEqual(grad(moved[INNER]) / grad(img[INNER]), 1.0, delta=0.05)
 
-    def test_shift_larger_than_padding_is_rejected(self):
+    def test_shift_beyond_default_padding_grows_it(self):
+        # Shifts past PAD (later frames, e.g. 13, move ~64 px) get more padding and stay exact away from the edges
+        img = texture(4)
+        d = PAD + 6
+        moved = shift_image(img, float(d), 0.0)
+        inner = (Ellipsis, slice(d + 8, -8), slice(8, -8))
+        self.assertGreater(psnr(moved[inner], img[..., :-d, :][..., 8:-8, 8:-8]), 80.0)
+
+    def test_shift_larger_than_image_is_rejected(self):
         with self.assertRaises(ValueError):
-            shift_image(texture(), PAD, 0.0)
+            shift_image(texture(), float(SIZE), 0.0)
 
 
 class TestTranslation(unittest.TestCase):

@@ -39,7 +39,7 @@ from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
 
-PAD = 64  # mirror padding (output pixels) around a shifted image; larger than any shift seen on BurstSR val
+PAD = 64  # minimum mirror padding (output pixels) around a shifted image; grown for larger shifts
 PROBES = {'probe_half_px': (0.5, 0.5), 'probe_whole_px': (8.0, 8.0)}
 
 
@@ -68,16 +68,17 @@ def translation(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def shift_image(img: torch.Tensor, dy: float, dx: float) -> torch.Tensor:
     """Move img [1, C, H, W] by (dy, dx) output pixels: mirror-pad, exact Fourier shift, crop back."""
-    if max(abs(dy), abs(dx)) > PAD - 4:
-        raise ValueError(f'Shift ({dy:.1f}, {dx:.1f}) is larger than the padding {PAD}')
     h, w = img.shape[-2:]
-    padded = F.pad(img, [PAD] * 4, mode='reflect')
+    pad = max(PAD, int(math.ceil(max(abs(dy), abs(dx)))) + 4)  # later frames (e.g. 13) can shift ~64 px
+    if pad >= min(h, w):
+        raise ValueError(f'Shift ({dy:.1f}, {dx:.1f}) is too large for a {h}x{w} image')
+    padded = F.pad(img, [pad] * 4, mode='reflect')
     hp, wp = padded.shape[-2:]
     fy = torch.fft.fftfreq(hp, device=img.device)[:, None]
     fx = torch.fft.fftfreq(wp, device=img.device)[None, :]
     ramp = torch.exp(-2j * math.pi * (fy * dy + fx * dx))
     shifted = torch.fft.ifft2(torch.fft.fft2(padded) * ramp).real
-    return shifted[..., PAD:PAD + h, PAD:PAD + w].clamp(0.0, 1.0)
+    return shifted[..., pad:pad + h, pad:pad + w].clamp(0.0, 1.0)
 
 
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
