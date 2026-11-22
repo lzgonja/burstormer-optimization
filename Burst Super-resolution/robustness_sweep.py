@@ -13,12 +13,19 @@ Degradations (--degradation) and what the level means:
     shift    maximum extra random shift of every non-reference frame, in packed raw pixels
     blur     Gaussian blur sigma applied to every frame, in packed raw pixels
     outlier  number of non-reference frames replaced by a badly misaligned copy (shifted by half the crop)
+    exposure light gathered relative to the real capture (1 = clean). Below 1: the frame is darker and gets the extra
+             shot noise a shorter exposure has (BurstSR noise profile at ISO 50, variance 1.8e-4 * x). Above 1:
+             brighter and clipped at white (noise is not reduced, so this only measures clipping). Both are
+             quantised to 10 bits. For exposure the metric colour-matches with the clean burst scaled by the same
+             factor, so a darker or brighter output is not penalised for its brightness (a camera corrects that
+             after merging), only for the noise and clipping the exposure caused.
 
 Two options turn this into a test of reference-frame selection:
-    --degrade_frames 0        damage only the listed frames (capture order); noise and blur only. E.g. `0` damages
-                              the default reference alone, `1 2 ... 13` everything except it.
-    --ref_policy guarded      choose the reference from the (damaged) burst before running the model: frame0, frame2
-                              or guarded (see ref_selection.py). Shows whether a selector avoids a damaged frame.
+    --degrade_frames 0        damage only the listed frames (capture order); noise, blur and exposure only. E.g. `0`
+                              damages the default reference alone, `1 2 ... 13` everything except it.
+    --ref_policy guarded      choose the reference from the (damaged) burst before running the model: frame0, frame2,
+                              guarded (see ref_selection.py) or algorithm2 (reference_selection/algorithm2.py).
+                              Shows whether a selector avoids a damaged frame.
 
 Outputs (in --out_dir): per_burst.csv, summary.csv, and with --save_images N a folder of images per burst and level.
 
@@ -53,8 +60,11 @@ DEFAULT_LEVELS = {
     'shift': [0, 1, 2, 4, 8, 16],
     'blur': [0, 0.5, 1, 1.5, 2, 3],
     'outlier': [0, 1, 2, 4, 8, 13],
+    'exposure': [1, 0.5, 0.25, 0.125, 0.0625],  # over-exposure: --levels 1 2 4 8 16
 }
-CLEAN_LEVEL = {'noise': 0, 'frames': 14, 'shift': 0, 'blur': 0, 'outlier': 0}
+CLEAN_LEVEL = {'noise': 0, 'frames': 14, 'shift': 0, 'blur': 0, 'outlier': 0, 'exposure': 1}
+SENSOR_SHOT_NOISE = 1.8e-4  # BurstSR EXIF noise profile at ISO 50: variance = 1.8e-4 * x (no read-noise term)
+SELECTIVE = ('noise', 'blur', 'exposure')  # degradations that --degrade_frames can restrict to some frames
 METHODS = ['model', 'bilinear', 'burst_mean']
 
 
@@ -103,6 +113,15 @@ def degrade(burst: torch.Tensor, kind: str, level: float, gen: torch.Generator) 
             out[0, i] = torch.roll(burst[0, i], shifts=(h // 2, w // 2), dims=(-2, -1))
         return out
 
+    if kind == 'exposure':
+        out = burst * level
+        if level < 1:
+            # A frame with `level` times the light has variance a * level * x; scaling the real frame gives
+            # a * level^2 * x, so add the difference
+            extra = SENSOR_SHOT_NOISE * level * (1 - level) * burst.clamp(min=0.0)
+            out = out + torch.randn(burst.shape, generator=gen, device=burst.device) * extra.sqrt()
+        return (out.clamp(0.0, 1.0) * 1023).round() / 1023
+
     raise ValueError(f'Unknown degradation {kind}')
 
 
@@ -138,14 +157,15 @@ def main() -> None:
     parser.add_argument('--save_images', default=0, type=int, help='Save images at every level for the first N bursts')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--degrade_frames', default=None, type=int, nargs='+',
-                        help='Capture-order indices of the frames to degrade (default: all). Noise and blur only')
+                        help='Capture-order indices of the frames to degrade (default: all). Noise, blur and exposure only')
     parser.add_argument('--ref_policy', default='frame0', choices=REF_POLICIES,
                         help='How the reference frame is chosen, from the degraded burst (default: frame 0)')
-    parser.add_argument('--guard_margin', default=GUARD_MARGIN, type=float,
-                        help='Guarded policy: how far the sharpness of frame 2 may be from its neighbours before it is replaced')
+    parser.add_argument('--guard_margin', default=None, type=float,
+                        help='Margin of the guarded or algorithm2 policy: how abnormal the default frame must be before it '
+                             f'is replaced (default: each policy has its own; {GUARD_MARGIN} for guarded)')
     args = parser.parse_args()
-    if args.degrade_frames is not None and args.degradation not in ('noise', 'blur'):
-        parser.error('--degrade_frames only applies to the noise and blur degradations')
+    if args.degrade_frames is not None and args.degradation not in SELECTIVE:
+        parser.error(f'--degrade_frames only applies to the {", ".join(SELECTIVE)} degradations')
 
     kind = args.degradation
     levels = args.levels or DEFAULT_LEVELS[kind]
@@ -183,14 +203,20 @@ def main() -> None:
             for li, level in enumerate(levels):
                 gen.manual_seed(args.seed * 1000003 + idx * 101 + li)
                 bad = degrade(burst, kind, level, gen)
+                damaged = list(range(burst.shape[1])) if args.degrade_frames is None else args.degrade_frames
                 if args.degrade_frames is not None and level != CLEAN_LEVEL[kind]:
                     mixed = burst.clone()
-                    mixed[:, args.degrade_frames] = bad[:, args.degrade_frames]
+                    mixed[:, damaged] = bad[:, damaged]
                     bad = mixed
+                # What the metric colour-matches with: the clean burst, at the damaged frames' brightness for exposure
+                match = burst
+                if kind == 'exposure' and level != CLEAN_LEVEL[kind]:
+                    match = burst.clone()
+                    match[:, damaged] = burst[:, damaged] * level
                 # The reference is chosen from what the model would actually receive, then moved to the front.
                 # `clean` is the undamaged burst in the same order, used only by the metric.
                 ref = select_reference(bad, args.ref_policy, args.guard_margin)
-                bad, clean = reorder(bad, ref), reorder(burst, ref)
+                bad, clean = reorder(bad, ref), reorder(match, ref)
                 with torch.no_grad():
                     outputs = {'model': model(bad).clamp(0.0, 1.0),
                                'bilinear': bilinear_reference(bad),
@@ -258,7 +284,7 @@ def main() -> None:
 
     # Breaking points along the sweep direction
     model_psnr = [mean[(lv, 'model')]['psnr'] for lv in levels]
-    log_scale = kind == 'noise'
+    log_scale = kind in ('noise', 'exposure')
     drop3 = crossing(levels, model_psnr, model_psnr[0] - 3.0, log_scale)
     margin = [mean[(lv, 'model')]['psnr'] - mean[(lv, 'bilinear')]['psnr'] for lv in levels]
     no_gain = crossing(levels, margin, 0.0, log_scale)

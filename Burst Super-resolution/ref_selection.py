@@ -17,7 +17,7 @@ margin). It avoided a blurred default, but it also switched TO a frame that had 
 from statistics import median
 from typing import Mapping
 
-REF_POLICIES = ['frame0', 'frame2', 'guarded']
+REF_POLICIES = ['frame0', 'frame2', 'guarded', 'algorithm2']  # algorithm2: reference_selection/algorithm2.py
 GUARD_DEFAULT = 2
 GUARD_WINDOW = 5
 GUARD_MARGIN = 0.2
