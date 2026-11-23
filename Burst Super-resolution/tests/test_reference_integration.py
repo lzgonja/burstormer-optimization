@@ -17,10 +17,22 @@ def test_default_reference_is_zero_and_unchanged():
     np.testing.assert_array_equal(reorder_burst(original), original)
 
 
-def test_all_available_methods_are_selected_automatically():
+def test_all_available_methods_are_selected_automatically(monkeypatch):
+    from reference_selection import algorithm1, algorithm2
+
+    calls = []
+    monkeypatch.setattr(algorithm1, 'select_reference_frame',
+                        lambda value: calls.append('gbrs') or 5)
+    monkeypatch.setattr(algorithm2, 'select_reference_frame',
+                        lambda value: calls.append('algorithm2') or 7)
+
     selections = select_available_references(burst())
-    assert list(selections) == ['frame0', 'gbrs']
-    assert selections == {'frame0': 0, 'gbrs': 0}
+    assert list(selections) == ['frame0', 'gbrs', 'algorithm2']
+    assert calls == ['gbrs', 'algorithm2']
+    assert selections['frame0'] == 0
+    assert 0 <= selections['gbrs'] < 14
+    assert 0 <= selections['algorithm2'] < 14
+    assert selections['algorithm2'] == 7
 
 
 def test_duplicate_selections_reuse_reconstruction():
@@ -31,7 +43,7 @@ def test_duplicate_selections_reuse_reconstruction():
         return value
 
     outputs = reconstruct_selected_references(
-        burst(), model, {'frame0': 0, 'gbrs': 7, 'another_method': 7})
+        burst(), model, {'frame0': 0, 'gbrs': 7, 'algorithm2': 7})
     assert set(outputs) == {0, 7}
     assert len(calls) == 2
     assert [7, 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13] in calls

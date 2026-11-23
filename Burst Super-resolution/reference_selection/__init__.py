@@ -6,7 +6,7 @@ from numbers import Integral
 
 
 NUM_FRAMES = 14
-AVAILABLE_METHODS = ("frame0", "gbrs")
+AVAILABLE_METHODS = ("frame0", "gbrs", "algorithm2")
 EXPERIMENT_FIELDS = (
     "burst_id",
     "selection_method",
