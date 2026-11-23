@@ -167,32 +167,18 @@ reference = α × synthetic_reference + (1 − α) × original_reference
 ### Implementation
 The algorithm uses an iterative, two-pass approach:
 
-Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
+1. Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
 
-Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
+2. Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
 
-Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optionally, blend the synthetic reference with the original frame 0 using a blending parameter α:
+3. Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optionally, blend the synthetic reference with the original frame 0 using a blending parameter α: reference = α × synthetic_reference + (1 − α) × original_reference
 
-reference = α × synthetic_reference + (1 − α) × original_reference
+4. Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
 
-Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
-
-Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
+5. Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
 
 ### Results
-The algorithm uses an iterative, two-pass approach:
-
-Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
-
-Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
-
-Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optionally, blend the synthetic reference with the original frame 0 using a blending parameter α:
-
-reference = α × synthetic_reference + (1 − α) × original_reference
-
-Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
-
-Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
+Initial experiments did not demonstrate an improvement over the baseline. In particular, increasing the synthetic-reference contribution resulted in progressively worse PSNR, SSIM, and LPIPS scores for the tested burst 0156_0036. This suggests that the approximate RGB-to-RAW conversion or the feedback mechanism may introduce errors that negatively affect reconstruction quality.
 
 ### References
 Chitwan Saharia, Jonathan Ho, William Chan, Tim Salimans, David J. Fleet, Mohammad Norouzi. 2021-06-30. Image Super-Resolution via Iterative Refinement. https://searcharxiv.org/abs/2104.07636
