@@ -28,8 +28,9 @@ From the 14-frame run of 2026-11-22:
 - **`shift_control.py`.**
   - New options: `--geometry`, `--estimator {reverse,forward}`, `--region {pair,all}` and `--factor`.
   - Both estimates are now always computed.
-  - New defaults: homography, reverse, pair.
-- **Tests.** `tests/test_shift_geometry.py` has 14 new tests. With the 10 existing ones, all 24 pass.
+  - New defaults: homography, reverse, pair. Section 5 adds `--fill target` and `--colour_ref moved`.
+- **Tests.** `tests/test_shift_geometry.py` has 14 new tests. With the 10 existing ones, all 24 pass (29 after
+  section 5).
 
 ## 3. Known-answer benchmark
 
@@ -63,7 +64,7 @@ With a 4x-upsampled warp that clipped to [0, 1], and the raw dense flow as true 
   homography fit (`consistent_dense`). For 0010_0027 frame 7 this replaced 10% of the pixels and removed the
   corner failure.
 
-### Final benchmark ([benchmark/](benchmark/))
+### Second benchmark, 5 bursts ([benchmark_5_bursts_mirror_fill/](benchmark_5_bursts_mirror_fill/))
 
 Warp round-trip loss: mean −0.006 dB, worst 0.05 dB. This is the floor for measuring errors here.
 
@@ -72,7 +73,7 @@ Warp round-trip loss: mean −0.006 dB, worst 0.05 dB. This is the floor for mea
 | Forward, translation (original method) | +0.090 | 0.285 | 1.44 | 0.39 | 0.65 |
 | Forward, homography | +0.088 | 0.283 | 1.45 | 0.39 | 0.63 |
 | Reverse, translation | +0.001 | 0.029 | 0.12 | 0.041 | 0.050 |
-| **Reverse, homography (default)** | **−0.003** | **0.030** | **0.09** | **0.039** | **0.037** |
+| **Reverse, homography** | **−0.003** | **0.030** | **0.09** | **0.039** | **0.037** |
 | Reverse, dense | −0.003 | 0.024 | 0.08 | 0.035 | 0.025 |
 | Mean of forward and reverse, homography | +0.042 | 0.142 | 0.73 | 0.20 | 0.31 |
 
@@ -91,43 +92,167 @@ RMSE by content change:
 - **The geometry model matters less than the direction:**
   - Reverse with translation is about as good as homography on these bursts.
   - Dense is best, but the true geometry is built from the same flow network, which flatters it.
-  - Homography is the default because it is fitted independently of the flow and cannot follow content changes.
+  - Homography became the default because it is fitted independently of the flow and cannot follow content
+    changes.
+- **These 5 bursts have shifts of at most 40 px, except 0019_0020.** Section 5 shows what they missed.
 
 ## 4. Regression
 
-`--geometry translation --region all --estimator forward` is the original method. It reproduces the 2026-11-22
-numbers to within 0.012 dB per row: gain_real within 0.0002, forward within 0.008, reverse within 0.011.
-The difference comes from the warp no longer clipping ([original_mode_check/](original_mode_check/)).
+The original method is `--geometry translation --region all --estimator forward --fill mirror --colour_ref fixed`.
+It reproduces the 2026-11-22 numbers to within 0.012 dB per row ([original_mode_check/](original_mode_check/)):
+- gain_real within 0.0002 dB;
+- forward within 0.008 dB;
+- reverse within 0.011 dB.
 
-## 5. Refined control on the 5 bursts x 14 frames ([five_bursts_14_frames/](five_bursts_14_frames/))
+The only difference is that the warp no longer clips.
 
-Defaults: homography, reverse, pair region (61% of pixels).
+## 5. First runs on 40 dev and 40 test bursts
 
-| Frame | Shift (px) | Penalty (dB) | Measured gain (dB) | Corrected gain (dB) |
+With the section 3 method (mirror fill, colour reference fixed), the 40-burst runs disagreed far more than the
+benchmark allowed. Forward and reverse were up to 7.5 dB apart on single bursts:
+- test 0105_0001 frame 9: measured +0.61 dB, forward +4.79 dB, reverse −2.76 dB;
+- dev 0212_0020 and 0156_0051.
+
+**Known-answer benchmark on those 4 bursts.** Reverse with homography was off by 1.11 dB RMS on 0212_0020 and
+0.36 dB on 0156_0051. Moving an image there and back alone lost up to 2.7 dB. Three causes were found.
+
+### Cause 1: the strip a move uncovers
+
+Moving an image by 40-70 px leaves a strip with no content, which the warp filled by mirroring. The metric fits
+one colour correction per 384 px patch by least squares over all its pixels. The mirrored strip spoils the flow
+and the colour fit for the whole patch, even though the strip itself is not scored.
+
+- **Fix: `--fill target` (default).** The strip is filled with the real content of the image being moved onto:
+  frame 0's output when moving back, frame k's when moving forward. It is left out of the score with an exact
+  coverage mask (`coverage`, `metric_patch_masks`).
+- **The benchmark is fixed too.** The synthetic O_k* now shows the real frame-k output where frame 0's view ends,
+  as a real output would.
+- **Effect.** On 0212_0020 the warp's round-trip loss fell from 2.7 dB to under 0.01 dB, and the reverse RMSE from
+  1.11 dB to 0.04 dB.
+
+### Cause 2: the homography on noisy content
+
+With strong noise, the 128 px tile correlations of 0212_0020 were useless, and the homography missed its own tiles
+by 14-19 px (at most 0.7 px otherwise). Blurring before the correlation did not help.
+
+- **Fix:** when the fit misses its tiles by more than 1 px RMS, use the global translation instead.
+- **On real data** this happens in 35-60% of comparisons (47% on the 5 bursts, 60% dev, 35% test), because outputs
+  from different reference frames differ in content. Reverse with translation is nearly as accurate as with a
+  homography (section 7), so the fallback costs little.
+
+### Cause 3: the colour reference
+
+The metric fits its colour correction from the reference input frame to the ground truth, then applies it to the
+output. That assumes the output has its reference frame's colours. Before, a moved output was scored with the raw
+frame of the position it was moved to: frame k's output, moved back, was colour-matched with frame 0's raw
+frame. When exposure or lighting changed between frames, the fit was wrong and both estimates paid several dB.
+
+- **Fix: `--colour_ref moved` (default).** The output's own raw frame moves along with it (`move_reference`, with
+  the geometry scaled to raw pixels by `to_raw`). The probes already worked this way. Only the position changes.
+- **Effect on the problem bursts** (gain over frame 0, dB). "Before" already has the target fill (cause 1); only the
+  colour reference differs:
+
+| Burst, frame | Measured | Forward before | Reverse before | Forward after | Reverse after |
+|---|---|---|---|---|---|
+| 0105_0001, 9 | +0.61 | +4.79 | −2.76 | −0.03 | +0.04 |
+| 0105_0001, 13 | +0.44 | +2.46 | −0.65 | −0.25 | +0.08 |
+| 0077_0014, 11 | −4.30 | +1.26 | −1.34 | −0.20 | +0.22 |
+| 0156_0051, 9 | −4.98 | −0.98 | −2.40 | −0.79 | −2.31 |
+| 0212_0020, 11 | −3.28 | −2.21 | −0.55 | −2.34 | −0.57 |
+
+On 0105_0001 and 0077_0014 the two estimates now agree. On 0156_0051 and 0212_0020 (60-70 px shifts) they still
+differ. The benchmark puts reverse at 0.11-0.13 dB RMS on those two bursts and forward at 0.46-0.90 dB.
+
+## 6. Tests
+
+- 29 tests pass: 10 in `tests/test_shift_control.py`, 19 in `tests/test_shift_geometry.py`.
+- New since section 2: the fill replaces only the uncovered strip; the patch masks follow the metric's patches;
+  the homography falls back on unreliable tiles; the raw geometry is the output geometry scaled down; moving the
+  reference changes only the first frame.
+
+## 7. Final benchmark, 9 bursts ([benchmark_9_bursts/](benchmark_9_bursts/))
+
+The 5 bursts plus the 4 hardest from the 40-burst runs (0105_0001, 0077_0014, 0212_0020, 0156_0051). 468 cases,
+shifts up to 110 px. Warp round-trip loss: mean −0.004 dB, worst 0.10 dB.
+
+| Estimator | Bias (dB) | RMSE (dB) | Worst error (dB) | RMSE 0-8 px | 8-24 px | 24-60 px | 60+ px |
+|---|---|---|---|---|---|---|---|
+| Forward, translation (original method) | +0.038 [+0.001, +0.071] | 0.385 | 4.17 | 0.132 | 0.161 | 0.543 | 0.708 |
+| Forward, homography | +0.036 | 0.384 | 4.17 | 0.133 | 0.161 | 0.541 | 0.705 |
+| Reverse, translation | −0.008 | 0.070 | 0.38 | 0.031 | 0.048 | 0.089 | 0.131 |
+| **Reverse, homography (default)** | **−0.011 [−0.017, −0.005]** | **0.068** | **0.38** | **0.033** | **0.045** | **0.085** | **0.126** |
+| Reverse, dense | −0.004 | 0.072 | 0.80 | 0.037 | 0.042 | 0.108 | 0.088 |
+| Mean of both, homography | +0.012 | 0.195 | 2.07 | 0.067 | 0.090 | 0.277 | 0.347 |
+
+RMSE by content change (dB):
+
+| Estimator | None | Blur 0.5 | Blur 1.0 | Noise |
 |---|---|---|---|---|
-| 1-3 | 2-7 | +0.03 | −0.04 to −0.00 | −0.00 to +0.03 |
-| 4-7 | 9-17 | +0.18 to +0.32 | −0.10 to −0.27 | +0.04 to +0.08 |
-| 8-9 | 21-23 | +0.55 to +0.56 | −0.54 to −0.58 | −0.04 to +0.02 |
-| 10-13 | 29-40 | +1.04 to +1.55 | −1.02 to −1.63 | −0.08 to +0.01 |
+| Forward, translation | 0.085 | 0.094 | 0.283 | 0.705 |
+| Reverse, homography | 0.063 | 0.063 | 0.052 | 0.088 |
 
-- Frame 13: measured −1.63 dB, penalty +1.55 dB [+0.04, +4.26], corrected −0.08 dB [−0.40, +0.23].
-- **No frame beats frame 0 once corrected.** Every interval includes zero.
-- **Best frame per burst:** measured +0.03 dB, corrected +0.18 dB [+0.06, +0.33]. Part of the corrected figure is
-  selection noise over 13 noisy estimates.
-- **The probes are unchanged:** half-pixel −0.015 dB, 8 x 8 px +0.012 dB.
-- **Fidelity:** with homography, the moved copy matches the real output at 43-49 dB. With dense it is 47-52 dB.
-  Content differences between reconstructions, not geometry, limit how far this goes.
+- **The default is accurate to 0.068 dB RMS, with a bias of −0.011 dB.** Its error grows with the shift: 0.03 dB
+  under 8 px, 0.13 dB at 60 px and more.
+- **Per burst its RMSE is 0.005-0.059 dB,** except on the two dev bursts with 60-70 px shifts (0.109 and
+  0.132 dB).
+- **The original forward method is 6 times less accurate** (0.385 dB). Its worst case is 4.2 dB.
 
-Compared with the 2026-11-22 forward/translation numbers, the corrected gains of frames 10-13 fall from
-+0.05 to +0.13 dB to −0.08 to +0.01 dB. On the benchmark the old estimator ran high (+0.09 dB bias overall, larger
-at large shifts), which matches this.
+## 8. Final results ([five_bursts_14_frames/](five_bursts_14_frames/), [dev_40_bursts/](dev_40_bursts/), [test_40_bursts/](test_40_bursts/))
 
-## 6. What is still open
+Defaults: homography (with fallback), reverse, pair region, target fill, colour reference moved, all 14 frames.
+Gains over frame 0 in dB, 95% bootstrap intervals over bursts. The bursts for dev and test are the 40 that
+`--limit 40` picks from `splits/dev.txt` and `splits/test.txt`, spread across scenes.
 
-- **The 40 dev and 40 test runs of 2026-11-21 used the forward estimator.** Their claims that frames 3 and 4
-  beat frame 0 rest on the estimate now known to run high. Their reverse column (+0.03 to +0.08 dB on test) is
-  the better number. Rerunning them with v2 defaults would settle it.
-- **The benchmark changes content only by blur and noise.** Real reconstructions differ in more complex ways.
-  The reverse estimate needs no assumption about content, but its geometry estimate could in principle be
-  disturbed by structural differences.
-- **Five bursts:** intervals stay wide.
+### Test, 40 bursts (4 scenes)
+
+| Frame | Shift (px) | Penalty | Measured | Corrected |
+|---|---|---|---|---|
+| 1 | 4.5 | +0.05 | +0.00 | +0.05 [−0.01, +0.10] |
+| 3 | 14.7 | +0.13 | −0.01 | +0.12 [+0.06, +0.18] |
+| 5 | 19.7 | +0.26 | −0.15 | +0.12 [+0.06, +0.17] |
+| 7 | 27.2 | +0.45 | −0.36 | +0.09 [+0.03, +0.16] |
+| 9 | 37.5 | +0.73 | −0.64 | +0.09 [+0.03, +0.15] |
+| 10 | 42.2 | +0.97 | −0.94 | +0.03 [−0.02, +0.08] |
+| 13 | 50.9 | +1.29 | −1.28 | +0.01 [−0.05, +0.08] |
+
+- **Frames 3-9 are better references than frame 0 by 0.08-0.12 dB.** Every interval is above zero. Frames 10-13
+  are level with frame 0.
+- **Forward and reverse now agree:** they differ by at most 0.08 dB, with per-burst correlation 0.43-0.91 (it was
+  negative at frames 7-13 before the fixes). The medians are close to the means (+0.05 to +0.10 dB at frames
+  1-9).
+- **Frame 0 is the best reference in only 1 of 40 test bursts.** The best frame per burst gains +0.18 dB measured
+  and +0.28 dB [+0.22, +0.34] corrected. The corrected figure is a maximum over 13 noisy estimates, so it runs
+  high.
+
+### Dev, 40 bursts (4 scenes, larger shifts)
+
+| Frame | Shift (px) | Penalty | Measured | Corrected | Median corrected |
+|---|---|---|---|---|---|
+| 1 | 8.2 | +0.04 | +0.14 | +0.18 [−0.01, +0.36] | +0.01 |
+| 3 | 20.0 | +0.31 | −0.10 | +0.21 [−0.03, +0.45] | +0.01 |
+| 5 | 35.2 | +1.01 | −0.81 | +0.20 [−0.07, +0.49] | −0.04 |
+| 9 | 56.3 | +2.40 | −2.25 | +0.15 [−0.16, +0.48] | −0.12 |
+| 13 | 67.8 | +3.02 | −2.81 | +0.21 [−0.07, +0.50] | −0.08 |
+
+- **The penalty is large on dev: up to 3.0 dB at frame 13** (68 px shifts). Almost all of the measured loss of the
+  later frames is penalty.
+- **The corrected gains are inconclusive.** The means are +0.12 to +0.22 dB with every interval including zero,
+  and the medians are near zero or slightly negative. A few bursts with large positive values drive the means.
+- **Forward and reverse still disagree at frames 5-13** (by 0.2-0.4 dB). These are the shifts where the benchmark
+  measures forward at 0.5-0.7 dB RMS and reverse at 0.09-0.13 dB.
+
+### The 5 bursts
+
+Penalty +1.57 dB at frame 13 (measured −1.65, corrected −0.08 [−0.35, +0.23]). Corrected gains lie between −0.08
+and +0.14 dB; frames 4 and 7 have intervals just above zero. Best frame per burst: +0.03 dB measured, +0.20 dB
+corrected.
+
+## 9. What is still open
+
+- **The geometry is mostly a translation on real data.** The homography falls back in 35-60% of comparisons. A
+  more robust non-rigid model could help on dev's 60-70 px shifts, where the benchmark error is largest
+  (0.13 dB RMS).
+- **The benchmark changes content only by blur and noise, on 9 bursts.** Real reconstructions differ in more complex
+  ways.
+- **Dev and test disagree on whether later frames beat frame 0.** Test supports frames 3-9; dev cannot tell. With
+  4 scenes per split, scene-to-scene variation is not captured by intervals over bursts.

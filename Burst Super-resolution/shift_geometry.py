@@ -68,7 +68,8 @@ def shift_image(img: torch.Tensor, dy: float, dx: float, clamp: bool = True) -> 
     clamp=True clips the result to [0, 1], as the original control did. That clipping is not neutral in dark,
     noisy areas (it cuts the slight undershoot of an exact shift), so warp_image does not clip."""
     h, w = img.shape[-2:]
-    pad = max(PAD, int(math.ceil(max(abs(dy), abs(dx)))) + 4)  # later frames (e.g. 13) can shift ~64 px
+    # At least PAD (less for images smaller than PAD), more for large shifts (later frames move up to ~110 px)
+    pad = max(min(PAD, min(h, w) - 1), int(math.ceil(max(abs(dy), abs(dx)))) + 4)
     if pad >= min(h, w):
         raise ValueError(f'Shift ({dy:.1f}, {dx:.1f}) is too large for a {h}x{w} image')
     padded = F.pad(img, [pad] * 4, mode='reflect')
@@ -95,8 +96,9 @@ class Geometry:
 
     def displacement(self, h: int, w: int) -> torch.Tensor:
         """Total displacement of the content at every pixel, [2, H, W] (dy, dx): shift - residual."""
-        d = self.shift.float().view(2, 1, 1).expand(2, h, w)
-        return d if self.residual is None else d - self.residual.to(d.device)
+        dev = self.residual.device if self.residual is not None else self.shift.device
+        d = self.shift.float().to(dev).view(2, 1, 1).expand(2, h, w)
+        return d if self.residual is None else d - self.residual
 
     def max_residual(self) -> float:
         return 0.0 if self.residual is None else float(self.residual.abs().max())
@@ -134,13 +136,70 @@ def pixel_grid(h: int, w: int, device) -> torch.Tensor:
     return torch.stack(torch.meshgrid(ys, xs, indexing='ij'))  # [2, H, W]
 
 
-def warp_image(img: torch.Tensor, g: Geometry, factor: int = 8) -> torch.Tensor:
-    """Apply geometry g to img [1, C, H, W]: exact Fourier shift, then low-loss sampling of the residual."""
-    moved = shift_image(img, *g.shift.tolist(), clamp=False)
-    if g.residual is None:
-        return moved
+def coverage(g: Geometry, h: int, w: int, device, margin: float = 2.0) -> torch.Tensor:
+    """[H, W] bool: pixels of warp_image(a, g) whose content comes from inside a (at least `margin` px from its
+    edges). Elsewhere the moved image holds no real content of a."""
+    s = pixel_grid(h, w, device) - g.shift.to(device).view(2, 1, 1)
+    if g.residual is not None:
+        s = s + g.residual.to(device)
+    return (s[0] >= margin) & (s[0] <= h - 1 - margin) & (s[1] >= margin) & (s[1] <= w - 1 - margin)
+
+
+def warp_image(img: torch.Tensor, g: Geometry, factor: int = 8, fill: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Apply geometry g to img [1, C, H, W]: exact Fourier shift, then low-loss sampling of the residual.
+
+    Where the moved image has no content of img (the strip uncovered by the move), it holds mirrored content, or
+    `fill` if given. The BurstSR metric fits one colour correction per patch over all its pixels, so mirrored
+    content there degrades the score of the whole patch even when the strip itself is not scored (up to several dB
+    for shifts of 40-70 px). Filling the strip with the real content of the image being moved onto avoids that.
+    """
     h, w = img.shape[-2:]
-    return sample(moved, pixel_grid(h, w, img.device) + g.residual.to(img.device), factor)
+    moved = shift_image(img, *g.shift.tolist(), clamp=False)
+    if g.residual is not None:
+        moved = sample(moved, pixel_grid(h, w, img.device) + g.residual.to(img.device), factor)
+    if fill is None:
+        return moved
+    return torch.where(coverage(g, h, w, img.device)[None, None], moved, fill)
+
+
+def metric_patch_masks(mask: torch.Tensor, erode: int = 4, raw_patch: int = 48, scale: int = 8):
+    """Split an [H, W] bool mask of an output into the patches the BurstSR metric scores (utils.metrics.make_patches:
+    48 raw px patches, i.e. 384 output px), each [1, 1, P, P] as align_patches returns its masks. The mask is eroded
+    by `erode` px first, to allow for the small flow the metric applies to an output already in place."""
+    m = mask[None, None].float()
+    if erode > 0:
+        m = -F.max_pool2d(-m, 2 * erode + 1, stride=1, padding=erode)
+    raw = mask.shape[-1] // scale
+    stride = (raw_patch - raw % raw_patch) * scale
+    size = raw_patch * scale
+    tiles = m.unfold(2, size, stride).unfold(3, size, stride)  # [1, 1, ny, nx, P, P]
+    ny, nx = tiles.shape[2:4]
+    return [tiles[0, 0, i, j][None, None] > 0.5 for i in range(ny) for j in range(nx)]
+
+
+def to_raw(g: Geometry, scale: int = 8) -> Geometry:
+    """The same geometry for the raw input frames, which have `scale` times fewer pixels than the output.
+
+    Raw pixel q covers output pixels scale*q .. scale*q + scale-1, so its sampling map is
+    (s_out(scale*q + c) - c) / scale with c = (scale - 1) / 2: the shift divided by scale, and the residual averaged
+    over each raw pixel's output pixels and divided by scale."""
+    res = None
+    if g.residual is not None:
+        res = F.avg_pool2d(g.residual[None], scale)[0] / scale
+    return Geometry(g.shift / scale, res, g.model, dict(g.info))
+
+
+def move_reference(burst: torch.Tensor, raw: torch.Tensor, g: Geometry, fill_raw: torch.Tensor,
+                   factor: int = 8) -> torch.Tensor:
+    """Copy of burst [1, N, 4, h, w] whose first frame (the metric's colour reference) is the raw frame `raw`
+    [1, 4, h, w] moved by the output geometry g, with the uncovered strip taken from `fill_raw`.
+
+    The metric colour-matches an output with its reference input frame, so that frame must have the output's
+    colours and sit where the output sits. Moving it along with the output changes the position and nothing else,
+    even when exposure or lighting differs between frames."""
+    out = burst.clone()
+    out[:, 0] = warp_image(raw, to_raw(g), factor, fill=fill_raw)
+    return out
 
 
 def invert(g: Geometry, iters: int = 20) -> Geometry:
@@ -222,7 +281,13 @@ def tile_shifts(a: torch.Tensor, b: torch.Tensor, tile: int = 128, grid: int = 5
     return torch.tensor(centres), torch.tensor(shifts), torch.tensor(peaks)
 
 
-def _parametric(a: torch.Tensor, b: torch.Tensor, model: str, tile: int, grid: int) -> Geometry:
+def _parametric(a: torch.Tensor, b: torch.Tensor, model: str, tile: int, grid: int,
+                max_fit_rms: float = 1.0) -> Geometry:
+    """Affine or homography fit to tile-wise phase correlation, after the global shift.
+
+    If the fitted map misses its own tiles by more than `max_fit_rms` output px (RMS), the tile shifts are not
+    reliable (flat or very noisy content: the fit then misses by 14-19 px, against at most 0.7 px otherwise on
+    the benchmark) and the global translation, measured on the whole image, is returned instead."""
     shift = translation(a, b)
     a1 = shift_image(a, *shift.tolist())
     centres, local, peaks = tile_shifts(a1, b, tile, grid)
@@ -239,9 +304,12 @@ def _parametric(a: torch.Tensor, b: torch.Tensor, model: str, tile: int, grid: i
     src = _apply_projective(m, p.permute(1, 2, 0)).permute(2, 0, 1)  # [2, H, W] sampling map
     residual = src - (p - shift.view(2, 1, 1))
     fit_err = (_apply_projective(m, centres) - dst).norm(dim=1)
-    return Geometry(shift, residual.to(a.device), model,
-                    {'fit_rms_px': float(fit_err.pow(2).mean().sqrt()), 'tiles': int(len(peaks)),
-                     'peak_median': float(peaks.median())})
+    info = {'fit_rms_px': float(fit_err.pow(2).mean().sqrt()), 'tiles': int(len(peaks)),
+            'peak_median': float(peaks.median()), 'fallback': False}
+    if info['fit_rms_px'] > max_fit_rms:
+        info['fallback'] = True
+        return Geometry(shift, None, model, info)
+    return Geometry(shift, residual.to(a.device), model, info)
 
 
 def _gauss_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:

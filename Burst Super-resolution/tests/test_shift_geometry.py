@@ -16,7 +16,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from shift_geometry import (Geometry, _apply_projective, estimate_geometry, invert, pixel_grid,  # noqa: E402
+from shift_geometry import (Geometry, _apply_projective, coverage, estimate_geometry, invert,  # noqa: E402
+                            metric_patch_masks, move_reference, pixel_grid, to_raw,
                             sample, shift_image, upsample, warp_image)
 
 SIZE = 320
@@ -107,6 +108,55 @@ class TestNoiseLevel(unittest.TestCase):
         self.assertLess(abs(self.noise_change_db(0.005, 1)), 0.01)
 
 
+class TestFillAndCoverage(unittest.TestCase):
+    def test_fill_replaces_only_the_uncovered_strip(self):
+        img, other = texture(12), texture(13)
+        g = Geometry(torch.tensor([20.0, -9.0]))
+        cov = coverage(g, SIZE, SIZE, 'cpu')
+        out = warp_image(img, g, fill=other)
+        # The strip the move uncovers: 20 rows at the top and 9 columns at the right, plus the 2 px margin
+        self.assertFalse(cov[:20].any())
+        self.assertFalse(cov[:, -9:].any())
+        self.assertTrue(cov[25:-5, 5:-14].all())
+        self.assertTrue(torch.equal(out[..., ~cov], other[..., ~cov]))
+        self.assertTrue(torch.allclose(out[..., cov], warp_image(img, g)[..., cov]))
+
+    def test_metric_patch_masks_follow_the_metric_patches(self):
+        # A 640 px output (80 raw px) is scored as 3 x 3 patches of 384 px with stride 128 (utils.metrics)
+        mask = torch.zeros(640, 640, dtype=torch.bool)
+        mask[:, 300:] = True
+        tiles = metric_patch_masks(mask, erode=0)
+        self.assertEqual(len(tiles), 9)
+        self.assertEqual(tuple(tiles[0].shape), (1, 1, 384, 384))
+        # Patch columns start at 0, 128 and 256 of the output: the mask edge (column 300) falls at 300, 172 and 44
+        for j, edge in enumerate((300, 172, 44)):
+            for i in range(3):
+                t = tiles[3 * i + j][0, 0]
+                self.assertTrue(t[:, edge:].all() and not t[:, :edge].any(), msg=f'patch ({i}, {j})')
+
+
+class TestRawReference(unittest.TestCase):
+    def test_raw_geometry_is_the_output_geometry_scaled_down(self):
+        g = projective_geometry(rotation_matrix(0.3, 1.001, ty=16.0, tx=-8.0))
+        r = to_raw(g)
+        self.assertTrue(torch.allclose(r.shift, g.shift / 8))
+        self.assertEqual(tuple(r.residual.shape), (2, SIZE // 8, SIZE // 8))
+        # Raw pixel q samples where its 8 output pixels sample, divided by 8
+        q = (5, 7)
+        out_mean = g.residual[:, 8 * q[0]:8 * q[0] + 8, 8 * q[1]:8 * q[1] + 8].mean(dim=(1, 2)) / 8
+        self.assertTrue(torch.allclose(r.residual[:, q[0], q[1]], out_mean, atol=1e-5))
+
+    def test_move_reference_moves_only_the_first_frame(self):
+        burst = torch.stack([texture(20 + i, size=40)[:, :3] for i in range(3)], dim=1)  # [1, 3, 3, 40, 40]
+        g = Geometry(torch.tensor([16.0, 8.0]))  # output pixels: 2 and 1 raw pixels
+        moved = move_reference(burst, burst[:, 2], g, burst[:, 1])
+        self.assertTrue(torch.equal(moved[:, 1:], burst[:, 1:]))
+        expected = shift_image(burst[:, 2], 2.0, 1.0, clamp=False)
+        # Content comes from raw frame 2 at least 2 px (the coverage margin) inside its edges
+        self.assertTrue(torch.allclose(moved[:, 0, :, 4:-2, 3:-2], expected[..., 4:-2, 3:-2], atol=1e-5))
+        self.assertTrue(torch.equal(moved[:, 0, :, :2], burst[:, 1, :, :2]))  # uncovered strip from fill
+
+
 class TestWarpAndInverse(unittest.TestCase):
     def test_translation_only_geometry_equals_shift_image(self):
         img = texture(5)
@@ -159,6 +209,15 @@ class TestEstimate(unittest.TestCase):
         translated = warp_image(a, estimate_geometry(a, b, 'translation'))
         self.assertGreater(psnr(moved[INNER], b[INNER]), 38.0)
         self.assertGreater(psnr(moved[INNER], b[INNER]), psnr(translated[INNER], b[INNER]) + 10.0)
+
+    def test_unreliable_tiles_fall_back_to_translation(self):
+        # Content swamped by noise: the tile shifts disagree, so the fit falls back to the global translation
+        a = texture(14)
+        gen = torch.Generator().manual_seed(3)
+        b = 0.5 + 0.3 * torch.randn(1, 3, SIZE, SIZE, generator=gen)
+        g = estimate_geometry(a, b, 'homography', tile=96, grid=5)
+        self.assertTrue(g.info['fallback'])
+        self.assertIsNone(g.residual)
 
     def test_pure_translation_gives_near_zero_residual(self):
         a = texture(11)

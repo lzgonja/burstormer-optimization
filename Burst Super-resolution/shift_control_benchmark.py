@@ -7,7 +7,8 @@ against each other. This script builds frame-k outputs whose answer is known:
     2. Measure the real geometry from O_0 to O_k: dense optical flow between the two outputs, kept where the flow
        both ways agrees within 1 px (elsewhere the homography fit), then strongly smoothed.
     3. Change the content of O_0 in a known way, C = D(O_0): nothing, Gaussian blur, or noise.
-    4. Synthetic frame-k output: O_k* = C moved by the real geometry of frame k.
+    4. Synthetic frame-k output: O_k* = C moved by the real geometry of frame k. Where frame 0's view ends, O_k*
+       shows the real frame-k output, as a real output would (those pixels are never scored).
     5. Known answer: score(C as reference 0) - score(O_0 as reference 0). Both are at frame 0's position, so no
        position penalty is involved.
     6. Every estimator sees only O_0, O_k* and the burst, exactly as on a real output, and its estimate is
@@ -38,7 +39,8 @@ import torch
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
-from shift_geometry import MODELS, _gauss_blur, consistent_dense, estimate_geometry, invert, warp_image
+from shift_geometry import (MODELS, _gauss_blur, consistent_dense, coverage, estimate_geometry, invert,
+                            metric_patch_masks, move_reference, warp_image)
 
 CHANGES = {'none': None, 'blur0.5': ('blur', 0.5), 'blur1.0': ('blur', 1.0), 'noise0.01': ('noise', 0.01)}
 BUCKETS = [(0, 8), (8, 24), (24, 60), (60, 1e9)]
@@ -72,6 +74,8 @@ def main() -> None:
     parser.add_argument('--models', default=','.join(MODELS), type=str)
     parser.add_argument('--changes', default=','.join(CHANGES), type=str)
     parser.add_argument('--factor', default=8, type=int, help='Upsampling factor of the warp')
+    parser.add_argument('--fill', default='target', choices=('target', 'mirror'),
+                        help='How the strip uncovered by a move is filled (as in shift_control.py)')
     parser.add_argument('--true_smooth', default=16.0, type=float,
                         help='Smoothing (output px) of the dense flow used as the true geometry')
     args = parser.parse_args()
@@ -104,7 +108,6 @@ def main() -> None:
                 o0 = model(burst).clamp(0.0, 1.0)
                 outs = {k: model(reorder(burst, k)).clamp(0.0, 1.0) for k in frames}
             true_geo = {k: consistent_dense(o0, outs[k], flow_net, smooth=args.true_smooth)[0] for k in frames}
-            del outs
             h, w = o0.shape[-2:]
             base_al = metrics.align_patches(o0, gt, burst)
 
@@ -113,26 +116,35 @@ def main() -> None:
                 truth_al = metrics.align_patches(content, gt, burst)
                 for k in frames:
                     g = true_geo[k]
-                    star = warp_image(content, g, args.factor)
-                    rb = reorder(burst, k)
+                    # A real frame-k output shows real scene content where frame 0's view ends; so does O_k*
+                    star = warp_image(content, g, args.factor, fill=outs[k])
+                    target = args.fill == 'target'
+                    masks = [metric_patch_masks(coverage(g, h, w, o0.device))]
+                    # O_k* holds frame 0's content and colours at frame k's position, so its colour reference is raw
+                    # frame 0 moved there too (shift_control.py --colour_ref moved does the same for every moved output)
+                    rb = move_reference(burst, burst[:, 0], g, burst[:, k])
                     star_al = metrics.align_patches(star, gt, rb)
                     fwd_al, rev_al, fidelity = {}, {}, {}
                     for m in models:
                         gf = estimate_geometry(o0, star, m, flow_net)
-                        moved = warp_image(o0, gf, args.factor)
-                        fwd_al[m] = metrics.align_patches(moved, gt, rb)
+                        moved = warp_image(o0, gf, args.factor, fill=star if target else None)
+                        fwd_al[m] = metrics.align_patches(moved, gt, move_reference(burst, burst[:, 0], gf, rb[:, 0]))
                         mse = torch.mean((moved[..., 64:-64, 64:-64] - star[..., 64:-64, 64:-64]) ** 2).item()
                         fidelity[m] = -10 * math.log10(mse + 1e-12)
                         gr = estimate_geometry(star, o0, m, flow_net)
-                        rev_al[m] = metrics.align_patches(warp_image(star, gr, args.factor), gt, burst)
+                        rev_al[m] = metrics.align_patches(warp_image(star, gr, args.factor, fill=o0 if target else None),
+                                                          gt, move_reference(burst, rb[:, 0], gr, burst[:, 0]))
+                        masks += [metric_patch_masks(coverage(gf, h, w, o0.device)),
+                                  metric_patch_masks(coverage(gr, h, w, o0.device))]
                     rt_al = None
                     if c_name == 'none':
-                        rt = warp_image(star, invert(g), args.factor)
-                        rt_al = metrics.align_patches(rt, gt, burst)
+                        rt = warp_image(star, invert(g), args.factor, fill=content if target else None)
+                        rt_al = metrics.align_patches(rt, gt, move_reference(burst, rb[:, 0], invert(g), burst[:, 0]))
 
                     all_al = [base_al, truth_al, star_al] + list(fwd_al.values()) + list(rev_al.values()) + \
                         ([rt_al] if rt_al is not None else [])
-                    region = [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in all_al]).all(dim=0)
+                    region = [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in all_al] +
+                                          [mk[p].to(base_al[p]['valid'].device) for mk in masks]).all(dim=0)
                               for p in range(len(base_al))]
                     region_frac = float(np.mean([r.float().mean().item() for r in region]))
 

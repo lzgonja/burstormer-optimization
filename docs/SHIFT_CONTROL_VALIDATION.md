@@ -30,61 +30,81 @@ For each burst and reference frame k:
    the outputs, kept where the flow both ways agrees within 1 px (elsewhere the homography fit), then smoothed.
 2. Change O_0's content in a known way, C = D(O_0): none, Gaussian blur of 0.5 or 1.0 output px, or noise with
    σ = 0.01.
-3. Build a synthetic O_k* by moving C with that geometry.
+3. Build a synthetic O_k* by moving C with that geometry. Where frame 0's view ends, O_k* shows the real frame-k
+   output, as a real output would. Its raw colour reference is frame 0's raw frame, moved the same way.
 4. **The known answer** is score(C as frame 0) minus score(O_0 as frame 0). Both images are at frame 0's position,
    so no penalty is involved.
 
-Every estimator sees only O_0, O_k* and the burst, exactly as on a real output. The 5 bursts x 13 frames x 4
-changes give 260 cases, with shifts up to 110 px.
+Every estimator sees only O_0, O_k* and the burst, exactly as on a real output.
 
-**The benchmark's own error floor is small.** Moving C there and back loses −0.006 dB on average, at worst 0.05 dB.
+The final benchmark uses 9 bursts: the 5 used throughout, plus the 4 hardest from the 40-burst runs (0105_0001,
+0077_0014, 0212_0020, 0156_0051). That gives 9 x 13 frames x 4 changes = 468 cases, with shifts up to 110 px.
+
+**The benchmark's own error floor is small.** Moving C there and back loses −0.004 dB on average, at worst 0.10 dB.
 
 ## Results
 
 | Estimator | Bias (dB) | RMSE (dB) | Worst error (dB) | RMSE at 60+ px shifts |
 |---|---|---|---|---|
-| Forward, translation (v1 method) | +0.090 [+0.059, +0.126] | 0.285 | 1.44 | 0.65 |
-| Forward, homography | +0.088 | 0.283 | 1.45 | 0.63 |
-| Reverse, translation | +0.001 | 0.029 | 0.12 | 0.050 |
-| **Reverse, homography (v2 default)** | **−0.003 [−0.007, +0.000]** | **0.030** | **0.09** | **0.037** |
-| Reverse, dense flow | −0.003 | 0.024 | 0.08 | 0.025 |
+| Forward, translation (v1 method) | +0.038 [+0.001, +0.071] | 0.385 | 4.17 | 0.708 |
+| Forward, homography | +0.036 | 0.384 | 4.17 | 0.705 |
+| Reverse, translation | −0.008 | 0.070 | 0.38 | 0.131 |
+| **Reverse, homography (v2 default)** | **−0.011 [−0.017, −0.005]** | **0.068** | **0.38** | **0.126** |
+| Reverse, dense flow | −0.004 | 0.072 | 0.80 | 0.088 |
 
 RMSE by content change, in dB:
 
 | Estimator | None | Blur 0.5 | Blur 1.0 | Noise |
 |---|---|---|---|---|
-| Forward, translation | 0.040 | 0.072 | 0.346 | 0.447 |
-| Reverse, homography | 0.026 | 0.024 | 0.023 | 0.042 |
+| Forward, translation | 0.085 | 0.094 | 0.283 | 0.705 |
+| Reverse, homography | 0.063 | 0.063 | 0.052 | 0.088 |
 
 - **The forward estimate is valid only when frame k's content matches frame 0's.** It measures the penalty on frame
-  0's content. The penalty depends on content: a blurred or noisier image is aligned differently by the metric.
-  With different content the forward estimate is off by 0.35-0.45 dB RMS, more at large shifts. This explains why
-  v1's two estimates disagreed.
-- **The reverse estimate is unbiased and accurate to 0.02-0.03 dB RMS** at every shift and with every content
-  change. It scores frame k's own reconstruction at frame 0's position, which is exactly the quantity wanted, so
-  it needs no assumption about content.
+  0's content, and the penalty depends on content: a blurred or noisier image is aligned differently by the metric.
+  With strongly different content (blur of 1 px, noise) it is off by 0.28-0.71 dB RMS, more at large shifts. This explains why v1's two estimates
+  disagreed.
+- **The reverse estimate is accurate to 0.07 dB RMS, with a bias of −0.011 dB.** It scores frame k's own
+  reconstruction at frame 0's position, which is exactly the quantity wanted, so it needs no assumption about
+  content. Its error is 0.03 dB under 8 px of shift and 0.13 dB at 60 px and more. Per burst it is 0.005-0.06 dB,
+  except on the two dev bursts with 60-70 px shifts (0.11 and 0.13 dB).
 - **The direction matters far more than the geometry model.** Reverse with translation is nearly as accurate as
-  with a homography here.
-  - Dense flow scores best, but the true geometry is built from the same flow network, which flatters it.
+  with a homography.
+  - Dense flow is not better overall, and the true geometry is built from the same flow network, which flatters
+    it.
   - The homography is the default because it is fitted independently of the flow and cannot follow content
     differences.
 
-## Two flaws found on the way, and fixed
+## Flaws found on the way, and fixed
 
-The first benchmark (warp with 4x upsampling, clipped to [0, 1]) had reverse RMSE 0.064 dB with errors of +0.2 dB
-on a noisy burst even at frame 1, which barely moves. Testing the warp directly showed two problems, both in the
-operation that moves an image, not in the metric:
+Five flaws were found, each by a benchmark or a real run that did not add up. All are in how an image is moved and
+scored, not in the metric.
 
-- **4x upsampling plus bicubic interpolation raises white-noise power by 4% (0.18 dB).** 8x upsampling keeps it
-  within 0.002 dB.
-- **Clipping to [0, 1] cuts noise power by 25% near black.** An exact shift undershoots slightly below 0, and
-  clipping removes that. BurstSR outputs are linear RGB and often dark, so this affects real outputs too. The warp
-  no longer clips.
+1. **The warp raised noise.** 4x upsampling plus bicubic interpolation raised white-noise power by 4% (0.18 dB).
+   Now 8x, which keeps it within 0.002 dB.
+2. **Clipping cut noise near black.** Clipping to [0, 1] cut noise power by 25% there. An exact shift undershoots
+   slightly below 0, and clipping removes that. BurstSR outputs are linear RGB and often dark. The warp no longer
+   clips.
+3. **The strip a move uncovers was mirror-filled.** Found on the 40-burst runs.
+   - The metric fits one colour correction per patch over all its pixels, so the mirrored content spoiled whole
+     patches, even though the strip itself was not scored.
+   - On a burst with 60 px shifts, the reverse estimate was off by 1.1 dB RMS, and moving an image there and back
+     lost up to 2.7 dB.
+   - Fix: fill the strip with the real content of the image being moved onto, and leave it out of the score with
+     an exact coverage mask.
+4. **The homography failed on noisy content.** It missed its own tiles by 14-19 px, against at most 0.7 px
+   otherwise. It now falls back to the global shift when its fit misses by more than 1 px RMS.
+5. **The colour reference stayed behind.**
+   - The metric colour-matches an output with its reference input frame. A moved output was scored with the raw
+     frame of its new position.
+   - When exposure changed between frames, both estimates paid several dB. On test burst 0105_0001 they were
+     7.5 dB apart.
+   - The raw frame now moves along with the output, as the probes always did. On that burst the estimates now
+     agree to within 0.33 dB.
 
-The first benchmark also used the raw flow as true geometry, which included an 11 px flow failure in one corner of
-0010_0027 frame 7. The flow is now kept only where it is consistent both ways.
+The benchmark also used the raw flow as true geometry at first, which included an 11 px flow failure. The flow is
+now kept only where it is consistent both ways.
 
-## Tests of the warp and the geometry (`tests/test_shift_geometry.py`, 14 tests)
+## Tests of the warp and the geometry (`tests/test_shift_geometry.py`, 19 tests)
 
 | Test | Result required |
 |---|---|
@@ -92,30 +112,35 @@ The first benchmark also used the raw flow as true geometry, which included an 1
 | A constant sub-pixel residual | Equals the exact Fourier shift (> 45 dB) |
 | A half-pixel move | Gradient energy kept within 5% |
 | White noise; noise near black, moved by a fractional geometry | Noise power kept within 0.01 dB |
-| Rotation of 0.5° with scale, there and back | Original recovered (> 45 dB; 59 dB measured with 4x) |
+| Rotation of 0.5° with scale, there and back | Original recovered (> 45 dB) |
 | The inverse geometry | Composes to the identity within 0.01 px |
-| Homography, affine and perspective fits | Known geometry recovered within 0.1-0.12 px (measured 0.03-0.10) |
+| Homography, affine and perspective fits | Known geometry recovered within 0.1-0.12 px |
 | The direction of the estimate | The moved image lands on the target, at least 10 dB closer than a translation |
+| Unreliable tiles | Fall back to the global shift |
+| The fill | Replaces exactly the uncovered strip |
+| Patch masks | Follow the metric's 384 px patches |
+| The raw geometry; moving the reference | The output geometry scaled by 1/8; only the first frame changes |
 
-Together with the 10 tests of v1 (`tests/test_shift_control.py`), all 24 pass.
+Together with the 10 tests of v1 (`tests/test_shift_control.py`), all 29 pass.
 
 ## Regression
 
-`--geometry translation --region all --estimator forward` is the v1 method. It reproduces the 2026-11-22 v1
-numbers to within 0.012 dB per row. The only change is that the warp no longer clips.
+`--geometry translation --region all --estimator forward --fill mirror --colour_ref fixed` is the v1 method. It
+reproduces the 2026-11-22 v1 numbers to within 0.012 dB per row. The only change is that the warp no longer clips.
 
 ## What v2 supports
 
-On the 5 bursts with all 14 reference frames
-([five_bursts_14_frames/summary.txt](logs/shift_control_v2_2026-11-22/five_bursts_14_frames/summary.txt)):
+All 14 reference frames, on 40 dev and 40 test bursts ([log](logs/shift_control_v2_2026-11-22/LOG.md), section 8):
 
-- **The metric's penalty for position grows with the shift, to 1.55 dB at frame 13.** Almost all of the later
-  frames' measured loss is this penalty.
-- **Corrected, no reference frame beats frame 0.** Mean corrected gains are between −0.08 and +0.08 dB, and every
-  interval includes zero.
-- **The v1 claim that frames 3 and 4 beat frame 0 on the test scenes rests on the forward estimate, which is
-  biased high.** The v1 reverse estimate (+0.07 and +0.08 dB on test) is the better number. A v2 run on the 40 test
-  bursts would settle it.
+- **The metric's penalty for position grows with the shift.** It reaches 1.3 dB at frame 13 on test (51 px) and
+  3.0 dB on dev (68 px). Almost all of the later frames' measured loss is this penalty.
+- **On the test scenes, frames 3-9 are better references than frame 0 by 0.08-0.12 dB.** Every interval is above
+  zero. Frames 10-13 are level with frame 0. Forward and reverse agree here, to within 0.08 dB.
+- **Frame 0 is the best reference in 1 of 40 test bursts.**
+
+Not established:
+- **On the dev scenes, no frame beats frame 0 with an interval above zero.** The means are positive, but the
+  medians are near zero.
 
 ## Threats to validity (v2)
 
@@ -124,14 +149,16 @@ On the 5 bursts with all 14 reference frames
   estimate. The fidelity columns flag that.
 - **The true geometry of the benchmark comes from real outputs but is smoothed.** Fine-scale parallax is not
   represented.
-- **Five bursts.** The benchmark's errors are per case and well estimated (260 cases). The corrected gains on
-  real data still have wide intervals.
+- **The geometry is mostly a translation on real data.** The homography falls back to the global shift in 35-60% of
+  real comparisons.
+- **Four scenes per split.** Intervals over bursts do not capture scene-to-scene variation, which may be why dev
+  and test differ.
 
 # Part 2: v1 self-consistency checks (2026-11-21)
 
 The sections below are unchanged from v1. They describe the forward estimate with a translation, on 40 dev and
-40 test bursts. Part 1 shows that its forward estimate is biased when content differs, so read its claims about
-frames beating frame 0 with that in mind.
+40 test bursts, frames 0-4. Part 1 shows that the forward estimate is off by 0.39 dB RMS when content differs, so
+its numbers are superseded by Part 1.
 
 ## The claim
 

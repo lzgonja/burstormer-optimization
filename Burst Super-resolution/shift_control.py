@@ -6,8 +6,11 @@ separates that penalty from real reconstruction quality:
 
     1. Run the model with references 0..K-1 (outputs O_0 ... O_k).
     2. Estimate the geometry between O_0 and each O_k (--geometry: a translation, an affine map, a homography, or
-       dense optical flow; see shift_geometry.py). Images are moved with an exact Fourier shift plus 8x band-limited
-       resampling of the rest, which keeps detail and noise level (tests/test_shift_geometry.py).
+       dense optical flow; see shift_geometry.py). The homography falls back to the global shift when it does not
+       fit its own tiles. Images are moved with an exact Fourier shift plus 8x band-limited resampling of the rest,
+       which keeps detail and noise level (tests/test_shift_geometry.py). The strip a move uncovers is filled with
+       the image moved onto and left out of the score (--fill target), and the moved output's own raw frame moves
+       with it as its colour reference (--colour_ref moved), so that only the position changes.
     3. Reverse estimate (the default, --estimator reverse): move O_k back to frame 0's position and score it as
        reference 0. Frame k's own reconstruction is then scored without its position, so
            corrected gain = PSNR(O_k moved to frame 0, as ref 0) - PSNR(O_0, as ref 0).
@@ -16,9 +19,9 @@ separates that penalty from real reconstruction quality:
            corrected gain = PSNR(O_k, as ref k) - PSNR(O_0 moved to frame k, as ref k).
 
 Which estimate is right was measured with known answers (shift_control_benchmark.py,
-docs/SHIFT_CONTROL_VALIDATION.md). The reverse estimate is unbiased and accurate to about 0.03 dB RMS. The forward
-estimate is biased when frame k's content differs from frame 0's (0.28 dB RMS), because the penalty depends on the
-content being moved. Both are always computed. `penalty` is corrected gain minus measured gain.
+docs/SHIFT_CONTROL_VALIDATION.md). On 9 bursts with shifts up to 110 px, the reverse estimate is accurate to
+0.068 dB RMS (bias -0.011 dB). The forward estimate is off by 0.385 dB RMS when frame k's content differs from frame
+0's, because the penalty depends on the content being moved. Both are always computed. `penalty` is corrected gain minus measured gain.
 
 Region (--region): `pair` scores frame k and frame 0 on the pixels valid and in view for every image of that
 comparison, so a frame's result does not depend on which other frames are in the run. `all` uses the pixels common
@@ -28,8 +31,8 @@ Two probes check the metric itself: O_0 moved by half an output pixel (resamplin
 (displacement only). For the probes, input frame 0 is moved by the same amount (at raw scale), because the metric
 colour-matches with it and it must stay in register with the output.
 
-The original control is `--geometry translation --region all --estimator forward` (with the warp now unclipped,
-it reproduces the 2026-11-22 numbers to within 0.012 dB).
+The original control is `--geometry translation --region all --estimator forward --fill mirror --colour_ref fixed`
+(with the warp now unclipped, it reproduces the 2026-11-22 numbers to within 0.012 dB).
 
 Example:
     python shift_control.py --bursts_file ./splits/dev.txt --limit 40 --refs 14 --out_dir ./Results/Real/sc_dev
@@ -48,8 +51,8 @@ import torch.nn.functional as F
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
-from shift_geometry import (MODELS, PAD, Geometry, estimate_geometry, shift_image,  # noqa: F401 (PAD: tests)
-                            translation, warp_image)
+from shift_geometry import (MODELS, PAD, Geometry, coverage, estimate_geometry, metric_patch_masks,  # noqa: F401
+                            move_reference, shift_image, translation, warp_image)
 
 PROBES = {'probe_half_px': (0.5, 0.5), 'probe_whole_px': (8.0, 8.0)}
 
@@ -83,6 +86,12 @@ def main() -> None:
                         help='pair: score frame k and frame 0 on the pixels common to that comparison; '
                              'all: on the pixels common to every image of the burst')
     parser.add_argument('--factor', default=8, type=int, help='Upsampling factor of the warp (non-translation)')
+    parser.add_argument('--colour_ref', default='moved', choices=('moved', 'fixed'),
+                        help='moved: score a moved output with its own raw reference frame moved along with it; '
+                             'fixed: with the raw frame of the position it was moved to, as in the first v2 runs')
+    parser.add_argument('--fill', default='target', choices=('target', 'mirror'),
+                        help='target: fill the strip a move uncovers with the real content of the image moved onto, '
+                             'and leave it out of the score; mirror: mirrored content, as in the first v2 runs')
     parser.add_argument('--reverse_check', action='store_true', help='No effect: both estimates are always computed')
     args = parser.parse_args()
 
@@ -100,7 +109,7 @@ def main() -> None:
     path = os.path.join(args.out_dir, 'per_burst.csv')
     fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'residual_max_px', 'psnr_frame0', 'psnr_real', 'psnr_forward',
               'psnr_reverse', 'gain_real', 'gain_forward', 'gain_reverse', 'gain_corrected', 'penalty',
-              'fidelity_forward', 'fidelity_reverse', 'common_frac']
+              'fidelity_forward', 'fidelity_reverse', 'geometry_fallback', 'common_frac']
     with open(path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -110,19 +119,31 @@ def main() -> None:
             with torch.no_grad():
                 outputs = {k: model(reorder(burst, k)).clamp(0.0, 1.0) for k in refs}
             o0 = outputs[0]
-            fwd_geo, rev_geo, fwd_img, rev_img = {}, {}, {}, {}
+            fwd_geo, rev_geo, fwd_img, rev_img, cover = {}, {}, {}, {}, {}
+            h, w = o0.shape[-2:]
             for k in refs[1:]:
                 fwd_geo[k] = estimate_geometry(o0, outputs[k], args.geometry, flow_net)
                 # Moving O_k back: estimated in that direction (for a translation, the forward shift reversed)
                 rev_geo[k] = Geometry(-fwd_geo[k].shift) if args.geometry == 'translation' else \
                     estimate_geometry(outputs[k], o0, args.geometry, flow_net)
-                fwd_img[k] = warp_image(o0, fwd_geo[k], args.factor)
-                rev_img[k] = warp_image(outputs[k], rev_geo[k], args.factor)
+                target = args.fill == 'target'
+                fwd_img[k] = warp_image(o0, fwd_geo[k], args.factor, fill=outputs[k] if target else None)
+                rev_img[k] = warp_image(outputs[k], rev_geo[k], args.factor, fill=o0 if target else None)
+                # Pixels holding moved content (not fill), per metric patch; only these are scored. With mirror
+                # fill the original behaviour is kept (no extra mask)
+                if target:
+                    both = coverage(fwd_geo[k], h, w, o0.device) & coverage(rev_geo[k], h, w, o0.device)
+                    cover[k] = metric_patch_masks(both)
 
             # Align every image once. Images at frame k's position are scored with the burst reordered to k
             real_al = {k: metrics.align_patches(outputs[k], gt, reorder(burst, k)) for k in refs}
-            fwd_al = {k: metrics.align_patches(fwd_img[k], gt, reorder(burst, k)) for k in refs[1:]}
-            rev_al = {k: metrics.align_patches(rev_img[k], gt, burst) for k in refs[1:]}
+            # Colour reference: the moved output's own raw frame, moved along with it (or the raw frame of the new
+            # position, --colour_ref fixed)
+            moved_ref = args.colour_ref == 'moved'
+            fwd_al = {k: metrics.align_patches(fwd_img[k], gt, move_reference(burst, burst[:, 0], fwd_geo[k], burst[:, k]) if moved_ref
+                                               else reorder(burst, k)) for k in refs[1:]}
+            rev_al = {k: metrics.align_patches(rev_img[k], gt, move_reference(burst, burst[:, k], rev_geo[k], burst[:, 0]) if moved_ref
+                                               else burst) for k in refs[1:]}
             probe_al = {}
             for p, (dy, dx) in PROBES.items():
                 moved = burst.clone()
@@ -130,12 +151,13 @@ def main() -> None:
                 probe_al[p] = metrics.align_patches(shift_image(o0, dy, dx), gt, moved)
             n_patches = len(real_al[0])
 
-            def region(als):
-                return [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in als]).all(dim=0)
+            def region(als, masks=()):
+                return [torch.stack([al[p]['valid'] & al[p]['in_view'] for al in als] +
+                                    [m[p].to(als[0][p]['valid'].device) for m in masks]).all(dim=0)
                         for p in range(n_patches)]
 
             common = region(list(real_al.values()) + list(fwd_al.values()) + list(rev_al.values()) +
-                            list(probe_al.values()))
+                            list(probe_al.values()), list(cover.values()))
             regions = {}
             for k in refs + list(PROBES):
                 if args.region == 'all':
@@ -145,7 +167,7 @@ def main() -> None:
                 elif k == 0:
                     regions[k] = region([real_al[0]])
                 else:
-                    regions[k] = region([real_al[0], real_al[k], fwd_al[k], rev_al[k]])
+                    regions[k] = region([real_al[0], real_al[k], fwd_al[k], rev_al[k]], [cover[k]] if k in cover else [])
 
             def psnr(al, k):
                 return metrics.score(al, regions=regions[k])[0]
@@ -165,7 +187,9 @@ def main() -> None:
                                 'residual_max_px': fwd_geo[k].max_residual(), 'psnr_forward': pf, 'psnr_reverse': pr,
                                 'gain_forward': pk - pf, 'gain_reverse': pr - p0,
                                 'fidelity_forward': fidelity(fwd_img[k], outputs[k], margin),
-                                'fidelity_reverse': fidelity(rev_img[k], o0, margin)})
+                                'fidelity_reverse': fidelity(rev_img[k], o0, margin),
+                                'geometry_fallback': int(fwd_geo[k].info.get('fallback', False)) +
+                                int(rev_geo[k].info.get('fallback', False))})
                 row['gain_corrected'] = row[f'gain_{args.estimator}']
                 row['penalty'] = row['gain_corrected'] - row['gain_real']
                 rows.append(row)
