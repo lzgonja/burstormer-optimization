@@ -20,7 +20,8 @@ takes about 18 ms per burst on the CPU.
   on dev, where it is 0.8 dB below. It uses frame 1 instead.
 - **Brightness: the mismatch matters, not the exposure.** A reference twice as bright as the rest of the burst
   costs 4-5 dB, even with no clipping and no extra noise. The well-exposedness weight of Buades et al. (2022)
-  points the wrong way here: it rewards the brighter frame. It was replaced by a brightness-mismatch term.
+  points the wrong way here: it rewards the brighter frame. It was replaced by a brightness-mismatch term, since
+  merged into the main cost with no change in any pick (see "Simplification: one cost term").
 
 ## Background: how much brightness varies in BurstSR
 
@@ -114,6 +115,24 @@ faults:
 3. **It missed over-exposure.** The well-exposedness weight rewards brighter frames in these dark scenes, and the
    brightness normalisation hides a gain difference. So a 2x reference was kept in 11 of 12 bursts. Fix: replace
    the weight by the brightness mismatch with the following frames, measured on the pixels they share.
+
+### Simplification: one cost term (2026-11-23)
+
+The version scored above used two terms, `residual * (1 + mismatch)`: each frame divided by its own brightness,
+then a separate brightness mismatch `|median log(brightness of c / brightness of j)|`. It was merged into one term:
+divide the candidate and its 8 comparison frames by the same typical brightness (their median), so a brightness
+difference stays in the residual.
+
+Both versions were run on 440 cases: 40 clean dev and 40 clean test bursts, and 12 dev and 12 test bursts with
+frame 0 damaged at every level in the tables above (blur, noise, under- and over-exposure). They picked the same
+reference in all 440, so every PSNR in this document holds for the current version unchanged. Healthy frames cost
+0.06 (median; at most 0.18), and a frame 2x too bright or too dark adds about 1 or 0.5.
+
+Two other simplifications were tested the same way and rejected:
+- **Whole-pixel alignment instead of sub-pixel:** 22 of 440 picks changed. It switched away from frame 0 on 6
+  clean bursts and kept a blurred frame 0 on test.
+- **Aligning every frame to frame 0 once, instead of to each candidate:** 29 of 440 picks changed, and the test
+  that the fallback is the earliest acceptable frame failed.
 
 ## Compared with the guarded selector (T16)
 

@@ -5,7 +5,6 @@ Run from `Burst Super-resolution/`:  python -m unittest tests.test_algorithm2 -v
 
 import os
 import sys
-import math
 import unittest
 
 import numpy as np
@@ -81,15 +80,24 @@ class TestAlignment(unittest.TestCase):
         self.assertLess(err.item(), 0.05)
 
 
-class TestAgreement(unittest.TestCase):
-    def test_brightness_mismatch_measured_on_shared_pixels(self):
+class TestCost(unittest.TestCase):
+    def test_brightness_difference_raises_the_cost(self):
         burst, _ = make_burst(seed=2)
-        clean = alg2.agreement(burst, [0, 1])
-        self.assertLess(clean[0][1], 0.05)
-        burst[0] = burst[0] * 2  # no clipping at this level
-        bright = alg2.agreement(burst, [0, 1])
-        self.assertAlmostEqual(bright[0][1], math.log(2), delta=0.05)
-        self.assertAlmostEqual(bright[0][0], clean[0][0], delta=0.1 * clean[0][0])  # normalised residual unchanged
+        clean = alg2.frame_costs(burst)
+        for k in (2.0, 0.5):  # no clipping at these levels
+            damaged = burst.clone()
+            damaged[0] = burst[0] * k
+            cost = alg2.frame_costs(damaged)[0]
+            # mean|k x - x| / mean x = |k - 1| on top of the noise residual of a healthy frame
+            self.assertAlmostEqual(cost, abs(k - 1), delta=0.1 + clean[0])
+            self.assertGreater(cost, 3 * clean[0])
+
+    def test_cost_does_not_depend_on_the_scene_level(self):
+        # Exposure normalisation: the same burst twice as bright (no clipping) has the same costs
+        burst, _ = make_burst(seed=2)
+        clean, scaled = alg2.frame_costs(burst), alg2.frame_costs(burst * 2)
+        for c in clean:
+            self.assertAlmostEqual(scaled[c], clean[c], delta=1e-4 * clean[c])
 
 
 class TestSelection(unittest.TestCase):

@@ -143,14 +143,14 @@ Each of the first 5 frames, c, is compared with the 8 frames that follow it. Eac
 (global translation by phase correlation, sub-pixel Fourier shift), and only the pixels they share are used. The
 cost is (lower is better):
 
-    cost(c) = residual(c) * (1 + mismatch(c))
+    cost(c) = median over the 8 frames j of mean|c - j|  /  typical brightness of the frames j
 
-- **residual(c)**: divide every frame by its mean brightness (the exposure normalisation, without needing exposure
-  times). Then take the median over the 8 frames of the mean absolute difference to c. A noisy, blurred,
-  under-exposed or clipped frame disagrees with the rest of the burst. Unlike a sharpness score, noise can only
-  make this worse.
-- **mismatch(c)**: `|median log(brightness of c / brightness of j)|`. A frame 2x too bright or too dark gets 0.69,
-  so its cost rises by 69%.
+- **Detail:** a noisy, blurred, under-exposed or clipped frame disagrees with the rest of the burst. Unlike a
+  sharpness score, noise can only make the cost worse.
+- **Brightness:** a frame 2x too bright or too dark adds about 1 or 0.5 to its cost. Healthy frames in clean val
+  bursts cost 0.06 (median; at most 0.18).
+- **Exposure normalisation:** dividing by the typical brightness of the burst (the median over the 8 frames, on
+  the shared pixels) makes the cost independent of the scene's overall level, without needing exposure times.
 
 Rule: keep frame 0 (the default) unless its cost is more than 20% above the median cost of frames 1-4. In that
 case use the earliest frame whose cost is within 20% of that median. Earlier frames are better references, as long
@@ -162,6 +162,9 @@ Tried and dropped:
 - The paper's well-exposedness weight `w(x) = 1 - (2x - 1)^12` rewards brighter frames in BurstSR's dark scenes.
   It therefore kept an over-exposed reference.
 - Taking the cheapest frame after rejecting the default often picked frame 3 or 4, about 1 dB worse than frame 1.
+- Two terms, `residual * (1 + mismatch)`: each frame divided by its own brightness, plus a separate brightness
+  mismatch `|median log(brightness of c / brightness of j)|`. It picked the same frame as the single cost in all
+  440 clean and damaged val cases tested, so it was merged into one term.
 
 ### Implementation
 `Burst Super-resolution/reference_selection/algorithm2.py`, `select_reference_frame(burst) -> int`, the same

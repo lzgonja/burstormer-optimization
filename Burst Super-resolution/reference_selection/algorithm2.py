@@ -9,20 +9,22 @@ Idea
     compared with the frames that follow it (j = c+1 ... c+8), each aligned to c by a global translation (phase
     correlation, sub-pixel Fourier shift), on the pixels they share:
 
-        cost(c) = residual(c) * (1 + mismatch(c))
+        cost(c) = median over j of mean|c - j|  /  typical brightness of the frames j
 
-    residual(c)  median over j of the mean absolute difference between c and j after dividing each by its mean
-                 brightness. Dividing by the brightness is the exposure normalisation of Buades et al. (2022,
-                 Sec. 3.2), done without exposure times. A noisy, blurred, under-exposed (its noise is amplified by
-                 the normalisation), clipped or misaligned frame disagrees with the others. Unlike a sharpness score,
-                 noise can only raise it.
-    mismatch(c)  |median over j of log(brightness of c / brightness of j)|, on the shared pixels, so that content
-                 moving into or out of the frame does not count. Burstormer is hurt by a reference whose brightness
-                 differs from the rest of the burst, even without extra noise or clipping: on 12 dev bursts a
-                 reference twice as bright as the others cost 4 dB. A frame 2x too bright or too dark gets
-                 mismatch 0.69, so its cost rises by 69%; the natural spread within a BurstSR burst is about 4%.
+    - A noisy, blurred, clipped or misaligned frame disagrees with the others in detail. Unlike a sharpness score,
+      noise can only raise the cost.
+    - A frame brighter or darker than the rest of the burst disagrees in level: a frame 2x too bright or too dark
+      adds about 1 or 0.5 to its cost, while healthy frames of clean val bursts cost 0.06 (median; at most 0.18).
+      Burstormer is hurt by such a reference even without extra noise or clipping: on 12 dev bursts a reference
+      twice as bright as the others cost 4 dB. The natural brightness spread within a BurstSR burst is about 4%.
+    - Dividing by the typical brightness of the burst is the exposure normalisation of Buades et al. (2022,
+      Sec. 3.2), done without exposure times. It makes the cost independent of the scene's overall level. The
+      brightness is measured on the shared pixels, so content moving into or out of the frame does not count.
 
-    Two choices were tested and dropped (docs/ALGORITHM2.md):
+    Three choices were tested and dropped (docs/ALGORITHM2.md):
+    - Normalising each frame by its own brightness, plus a separate brightness-mismatch term,
+      cost = residual * (1 + |median log(brightness c / brightness j)|): it picked the same frame as this single
+      cost in all 440 clean and damaged val cases tested, with two terms instead of one.
     - Comparing with the whole burst instead of the following frames favoured frames near the middle of the burst,
       because frames further apart in time differ more after alignment.
     - The well-exposedness weight of Buades et al. (2022, Sec. 4), w(x) = 1 - (2x - 1)^12, rewards brighter frames
@@ -41,7 +43,7 @@ arXiv:2201.07066, 2022.
 """
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -118,18 +120,16 @@ def _comparison_frames(c: int, n: int, candidates: list, neighbours: int) -> lis
     return later or [j for j in range(n) if j != c]
 
 
-def agreement(burst: torch.Tensor, candidates: Optional[list] = None,
-              neighbours: int = NEIGHBOURS) -> Dict[int, Tuple[float, float]]:
-    """(residual, mismatch) of each candidate against the frames that follow it, as defined in the module docstring.
-    Lower is better for both. Returns {frame: (residual, mismatch)}."""
+def frame_costs(burst, window: int = WINDOW, neighbours: int = NEIGHBOURS) -> Dict[int, float]:
+    """Cost of each of the first `window` frames as defined in the module docstring. Lower is better."""
     frames = _as_frames(burst)
     n, _, h, w = frames.shape
     if n < 2:
         raise ValueError('Needs at least two frames')
-    candidates = list(range(n)) if candidates is None else candidates
+    candidates = list(range(min(window, n)))
     green = frames[:, 1:3].mean(dim=1)  # [N, H, W], best-sampled colour
 
-    result = {}
+    costs = {}
     for c in candidates:
         others = _comparison_frames(c, n, candidates, neighbours)
         shifts = _phase_shifts(green, c)
@@ -137,19 +137,11 @@ def agreement(burst: torch.Tensor, candidates: Optional[list] = None,
         # Shared pixels: drop the wrapped-around border, keeping at least the central half of the image
         border = min(int(math.ceil(shifts[others + [c]].abs().max().item())) + 1, min(h, w) // 4)
         a = aligned[:, border:h - border, border:w - border]
-        level = a.mean(dim=(1, 2)).clamp(min=_EPS)  # brightness of every frame on the shared pixels
-        normalised = a / level[:, None, None]
-        residual = (normalised[others] - normalised[c:c + 1]).abs().flatten(1).mean(dim=1).median().item()
-        mismatch = abs(torch.log(level[c] / level[others]).median().item())
-        result[c] = (residual, mismatch)
-    return result
-
-
-def frame_costs(burst: torch.Tensor, window: int = WINDOW) -> Dict[int, float]:
-    """cost = residual * (1 + mismatch) for each of the first `window` frames. Lower is better."""
-    frames = _as_frames(burst)
-    candidates = list(range(min(window, frames.shape[0])))
-    return {c: r * (1.0 + m) for c, (r, m) in agreement(frames, candidates).items()}
+        # Typical brightness of the comparison frames on the shared pixels: one scale for c and all of them, so a
+        # brightness difference stays in the residual
+        typical = a[others].mean(dim=(1, 2)).clamp(min=_EPS).median()
+        costs[c] = ((a[others] - a[c:c + 1]).abs().flatten(1).mean(dim=1).median() / typical).item()
+    return costs
 
 
 def choose_from_costs(costs: Dict[int, float], default: int = DEFAULT_REF, margin: float = MARGIN) -> int:
