@@ -181,6 +181,6 @@ The algorithm uses an iterative, two-pass approach:
 Initial experiments did not demonstrate an improvement over the baseline. In particular, increasing the synthetic-reference contribution resulted in progressively worse PSNR, SSIM, and LPIPS scores for the tested burst 0156_0036. This suggests that the approximate RGB-to-RAW conversion or the feedback mechanism may introduce errors that negatively affect reconstruction quality.
 
 ### References
-Chitwan Saharia, Jonathan Ho, William Chan, Tim Salimans, David J. Fleet, Mohammad Norouzi. 2021-06-30. Image Super-Resolution via Iterative Refinement. https://searcharxiv.org/abs/2104.07636
-Bannore, V., & Swierkowski, L. (2006). An iterative approach to image SUPER-RESOLUTION. International Federation of Info Processing. https://opendl.ifip-tc6.org/db/conf/ifip12/iip2006/BannoreS06.pdf 
+- Chitwan Saharia, Jonathan Ho, William Chan, Tim Salimans, David J. Fleet, Mohammad Norouzi. 2021-06-30. Image Super-Resolution via Iterative Refinement. https://searcharxiv.org/abs/2104.07636
+- Bannore, V., & Swierkowski, L. (2006). An iterative approach to image SUPER-RESOLUTION. International Federation of Info Processing. https://opendl.ifip-tc6.org/db/conf/ifip12/iip2006/BannoreS06.pdf 
 
