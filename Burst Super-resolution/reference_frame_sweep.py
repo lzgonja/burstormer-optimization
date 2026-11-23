@@ -33,7 +33,7 @@ from Network_Real_burstSR import Base_Model
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from ref_selection import GUARD_MARGIN, guarded_choice
-from reference_selection import reorder_burst
+from reference_selection import algorithm2, reorder_burst
 import utils.spatial_color_alignment as sca_utils
 from utils.metrics import make_patches
 from utils.warp import warp
@@ -268,16 +268,20 @@ def reorder(burst: torch.Tensor, ref: int) -> torch.Tensor:
     return reorder_burst(burst, ref)
 
 
-def select_reference(burst: torch.Tensor, policy: str, margin: float = GUARD_MARGIN) -> int:
+def select_reference(burst: torch.Tensor, policy: str, margin: float = None) -> int:
     """Index of the frame to use as reference, from the input burst alone. burst: [1, N, 4, H, W].
-    Policies: frame0 (original behaviour), frame2 (best fixed frame on dev), guarded (see ref_selection.py)."""
+    Policies: frame0 (original behaviour), frame2 (best fixed frame on dev), guarded (see ref_selection.py),
+    algorithm2 (exposure-aware consistency, see reference_selection/algorithm2.py).
+    `margin` overrides the policy's own default margin."""
     if policy == 'frame0':
         return 0
     if policy == 'frame2':
         return 2
     if policy == 'guarded':
         sharp = frame_sharpness_smoothed(burst).tolist()
-        return guarded_choice(dict(enumerate(sharp)), margin=margin)
+        return guarded_choice(dict(enumerate(sharp)), margin=GUARD_MARGIN if margin is None else margin)
+    if policy == 'algorithm2':
+        return algorithm2.select_reference_frame(burst, margin=algorithm2.MARGIN if margin is None else margin)
     raise ValueError(f'Unknown reference policy {policy}')
 
 
