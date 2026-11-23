@@ -121,21 +121,74 @@ trained model weights.
 
 ---
 
-## Algorithm 2: TBD
+## Algorithm 2: Exposure-aware consistency selection
 
 **Contributor:** Stanley Cao
 
 ### Motivation
-Why might this approach identify a better reference frame?
+Burstormer reconstructs the scene as its reference frame sees it. In our tests a damaged reference costs up to
+10 dB, while a damaged non-reference frame costs almost nothing. On clean bursts the choice among the early frames
+barely matters (at most about 0.1 dB on the test scenes). The gain from selection is therefore insurance: notice
+when the default reference is badly exposed, noisy or blurred, and use a better early frame instead.
+
+The brightness part starts from Buades et al. (2022), who normalise every RAW frame to the reference exposure
+before comparing frames. BurstSR bursts use one exposure, so brightness alone almost never separates frames
+(median spread 4% within a burst, almost no clipping). It is combined with a consistency check, which also
+catches noise and blur. Our tests showed that what hurts Burstormer is a reference whose brightness differs from
+the rest of the burst. A reference that is merely darker or brighter is not the problem: one twice as bright as
+the other frames costs 4 dB even without clipping or extra noise.
 
 ### Method
-Describe how the algorithm works and how it selects a frame.
+Each of the first 5 frames, c, is compared with the 8 frames that follow it. Each of those frames is aligned to c
+(global translation by phase correlation, sub-pixel Fourier shift), and only the pixels they share are used. The
+cost is (lower is better):
+
+    cost(c) = median over the 8 frames j of mean|c - j|  /  typical brightness of the frames j
+
+- **Detail:** a noisy, blurred, under-exposed or clipped frame disagrees with the rest of the burst. Unlike a
+  sharpness score, noise can only make the cost worse.
+- **Brightness:** a frame 2x too bright or too dark adds about 1 or 0.5 to its cost. Healthy frames in clean val
+  bursts cost 0.06 (median; at most 0.18).
+- **Exposure normalisation:** dividing by the typical brightness of the burst (the median over the 8 frames, on
+  the shared pixels) makes the cost independent of the scene's overall level, without needing exposure times.
+
+Rule: keep frame 0 (the default) unless its cost is more than 20% above the median cost of frames 1-4. In that
+case use the earliest frame whose cost is within 20% of that median. Earlier frames are better references, as long
+as they are healthy.
+
+Tried and dropped:
+- Comparing with the whole burst favoured frames near the middle of the burst. Frames further apart in time differ
+  more after alignment, so frame 4 looked 10-14% better than frame 0 on clean bursts.
+- The paper's well-exposedness weight `w(x) = 1 - (2x - 1)^12` rewards brighter frames in BurstSR's dark scenes.
+  It therefore kept an over-exposed reference.
+- Taking the cheapest frame after rejecting the default often picked frame 3 or 4, about 1 dB worse than frame 1.
+- Two terms, `residual * (1 + mismatch)`: each frame divided by its own brightness, plus a separate brightness
+  mismatch `|median log(brightness of c / brightness of j)|`. It picked the same frame as the single cost in all
+  440 clean and damaged val cases tested, so it was merged into one term.
 
 ### Implementation
-Describe the implementation and any important parameters.
+`Burst Super-resolution/reference_selection/algorithm2.py`, `select_reference_frame(burst) -> int`, the same
+interface as algorithm 1. It takes a burst `(N, 4, H, W)` as a torch tensor or numpy array (packed RGGB in [0, 1];
+`(1, N, 4, H, W)` is also accepted) and returns the frame index as a Python int. A wrong shape, an empty burst or
+non-finite values raise `ValueError`. It runs on CPU or GPU and needs no network or ground truth. Parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `DEFAULT_REF` | 0 | Frame kept unless it looks abnormal (the frame Burstormer was trained to use) |
+| `WINDOW` | 5 | Candidates are the first 5 frames; on BurstSR the best reference is always one of them |
+| `NEIGHBOURS` | 8 | Each candidate is compared with this many following frames |
+| `MARGIN` | 0.2 | How much worse than its neighbours the default must be before switching. Chosen on clean dev bursts |
+
+Evaluation: `reference_frame_sweep.py` and `robustness_sweep.py` accept `--ref_policy algorithm2`.
+`robustness_sweep.py --degradation exposure` simulates an under- or over-exposed frame. `score_ref_policies.py`
+scores policies on clean bursts from a reference sweep. Tests: `python -m unittest tests.test_algorithm2`.
+Results: [docs/ALGORITHM2.md](docs/ALGORITHM2.md).
 
 ### References
-- TBD
+- A. Buades, O. Martorell, M. Sánchez-Beeckman, "Joint denoising and HDR for RAW video sequences",
+  arXiv:2201.07066, 2022 (exposure normalisation, Sec. 3.2; well-exposedness weight, Sec. 4, tested and dropped).
+- S. W. Hasinoff et al., "Burst photography for high dynamic range and low-light imaging on mobile cameras",
+  SIGGRAPH Asia 2016 (HDR+: the reference frame is chosen among the first frames of the burst).
 
 ---
 
