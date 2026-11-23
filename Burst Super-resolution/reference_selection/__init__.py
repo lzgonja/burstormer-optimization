@@ -7,11 +7,15 @@ from numbers import Integral
 
 NUM_FRAMES = 14
 AVAILABLE_METHODS = ("frame0", "gbrs", "algorithm2")
+EVALUATION_METHODS = AVAILABLE_METHODS + ("algorithm3",)
 EXPERIMENT_FIELDS = (
     "burst_id",
     "selection_method",
+    "experiment_type",
     "selected_reference_index",
-    "corrected_psnr_gain",
+    "psnr_gain_vs_frame0",
+    "alpha",
+    "evaluation_method",
 )
 
 
@@ -59,6 +63,10 @@ def reconstruct_selected_references(burst, model, selections):
     """Run one reconstruction per unique selected index."""
     return {reference: model(reorder_burst(burst, reference))
             for reference in set(selections.values())}
+
+
+def reconstruction_filename(burst_id, method):
+    return f"{burst_id}_{method}.png"
 
 
 def write_experiment_csv(path, rows):

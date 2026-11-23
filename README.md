@@ -15,26 +15,34 @@ successive image shots and merge their complimentary information to achieve high
 transformer-based architecture for burst image restoration and enhancement. In comparison to existing works, our approach exploits multi-scale local and non-local features to achieve improved alignment and feature fusion. Our key idea is to enable inter-frame communication in the burst neighborhoods for information aggregation and progressive fusion while modeling the burst-wide context. However, the input burst frames need to be properly aligned before fusing their information. Therefore, we propose an enhanced deformable alignment module for aligning burst features with regards to the reference frame. Unlike existing methods, the proposed alignment module not only aligns burst features but also exchanges feature information and maintains focused communication with the reference frame through the proposed referencebased feature enrichment mechanism, which facilitates handling complex motions. After multi-level alignment and enrichment, we re-emphasize on inter-frame communication within burst using a cyclic burst sampling module. Finally, the inter-frame information is aggregated using the proposed burst feature fusion module followed by progressive upsampling. Our Burstormer outperforms state-ofthe-art methods on burst super-resolution, burst denoising and burst low-light enhancement.*
 <hr />
 
-## Adaptive Reference-Frame Selection for Burst Super-Resolution
+## Reference-Frame Selection and Refinement for Burst Super-Resolution
 
 *University of Toronto — CSC2529: Computational Imaging, Fall 2026*
 
-This project extends Burstormer to investigate whether adaptive reference-frame selection can improve burst super-resolution. While the original model uses the first frame of each burst as its reference, we explore three selection algorithms that choose a reference based on information from the input burst.
+This project extends Burstormer to investigate whether changing its reference-frame strategy can improve burst super-resolution. While the original model uses the first frame of each burst as its reference, we explore two approaches: adaptive reference-frame selection and iterative reference-frame refinement.
 
 ### Approach
 
-For each burst, we compare the original fixed frame-0 baseline against our adaptive reference-selection methods. Each selected reference is moved to the first position before being passed into Burstormer, without modifying the original model architecture.
+**Part 1 — Adaptive Reference-Frame Selection**
 
-To evaluate reconstruction quality, we use a shift-control method that accounts for positional bias when comparing different reference frames. Performance is measured as the corrected PSNR gain relative to frame 0.
+We evaluate two algorithms that select a reference from the original 14-frame burst: Gradient-Based Reference Selection (GBRS) and Exposure-Aware Consistency. Each selected reference is moved to the first position before being passed into Burstormer, without modifying the model architecture.
+
+Reconstruction quality is evaluated using a shift-control method that accounts for positional bias between different reference frames. Performance is measured as the corrected PSNR gain relative to the fixed frame-0 baseline.
+
+**Part 2 — Iterative Reference-Frame Refinement**
+
+Algorithm 3 takes Burstormer's initial reconstruction, converts it into an approximate RAW reference, and blends it with the original frame 0 (α = 0.25). The modified burst is then passed through Burstormer a second time, keeping the other 13 frames unchanged.
+
+Performance is measured using the PSNR gain relative to the frame-0 baseline over a shared valid image region.
 
 ### Running the Evaluation
 
-The automated evaluation pipeline is implemented in `Burst Super-resolution/Track_2_evaluation.py`. It requires the BurstSR dataset, a trained Burstormer checkpoint, and a compatible CUDA environment.
+Both approaches are integrated into `Burst Super-resolution/Track_2_evaluation.py`. A single execution runs all methods, with Algorithm 3 reusing the cached frame-0 reconstruction. The pipeline requires the BurstSR dataset, a trained Burstormer checkpoint, and a compatible CUDA environment.
 
 Outputs are saved under `Results/Real/Testing Phase/`:
 
-- **Reconstructed images:** Individual 16-bit PNGs for each burst and selection method.
-- **`per_burst.csv`:** Selected reference indices and corrected PSNR gains relative to frame 0.
+- **Reconstructed images:** Individual 16-bit PNGs for each burst and method (frame 0, GBRS, Algorithm 2, and Algorithm 3).
+- **`per_burst.csv`:** Reference indices (where applicable), PSNR gains relative to frame 0, blending factors, and evaluation methods.
 
 ## Network Architecture
 

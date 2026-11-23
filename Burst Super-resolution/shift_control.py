@@ -48,9 +48,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from datasets.burstsr_dataset import BurstSRDataset
-from pwcnet.pwcnet import PWCNet
-from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
+from reference_selection import NUM_FRAMES, reorder_burst as reorder
 from shift_geometry import (MODELS, PAD, Geometry, coverage, estimate_geometry, metric_patch_masks,  # noqa: F401
                             move_reference, shift_image, translation, warp_image)
 
@@ -100,6 +98,17 @@ def evaluate_reference_pair(outputs, reference, burst, gt, metrics, flow_net, ge
     return psnr_reverse - psnr_frame0
 
 
+def evaluate_same_reference_pair(baseline, candidate, burst, gt, metrics):
+    """PSNR gain for two frame-0-view outputs scored on their shared valid region."""
+    base_al = metrics.align_patches(baseline, gt, burst)
+    candidate_al = metrics.align_patches(candidate, gt, burst)
+    regions = [base['valid'] & base['in_view'] & selected['valid'] & selected['in_view']
+               for base, selected in zip(base_al, candidate_al)]
+    psnr_frame0 = metrics.score(base_al, regions=regions)[0]
+    psnr_candidate = metrics.score(candidate_al, regions=regions)[0]
+    return psnr_candidate - psnr_frame0
+
+
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
     rng = np.random.default_rng(seed)
     means = x[rng.integers(0, len(x), (n, len(x)))].mean(axis=1)
@@ -113,6 +122,10 @@ def fidelity(a: torch.Tensor, b: torch.Tensor, margin: int) -> float:
 
 
 def main() -> None:
+    from datasets.burstsr_dataset import BurstSRDataset
+    from pwcnet.pwcnet import PWCNet
+    from reference_frame_sweep import FastAlignedMetrics, load_model, select_bursts, set_seed
+
     parser = argparse.ArgumentParser(description='Measure the metric penalty for the position of the reference frame')
     parser.add_argument('--weights', default='./Trained_models/Real/burstormer_burstsr_train.pth', type=str)
     parser.add_argument('--data_root', default='./burstsr_dataset', type=str)

@@ -27,9 +27,9 @@ from pwcnet.pwcnet import PWCNet
 import data_processing.camera_pipeline as rgb2raw
 from data_processing.camera_pipeline import *
 from reference_frame_sweep import FastAlignedMetrics
-from reference_selection import (reconstruct_selected_references, select_available_references,
-                                 write_experiment_csv)
-from shift_control import evaluate_reference_pair
+from reference_selection import (reconstruct_selected_references, reconstruction_filename,
+                                 select_available_references, write_experiment_csv)
+from shift_control import evaluate_reference_pair, evaluate_same_reference_pair
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -48,6 +48,8 @@ parser = argparse.ArgumentParser(description='Real burst super-resolution using 
 
 parser.add_argument('--result_dir', default='./Results/Real/', type=str, help='Directory for results')
 parser.add_argument('--weights', default='./Trained_models/Real/model_best.pth', type=str, help='Path to pre-trained weights')
+parser.add_argument('--skip_algorithm3', action='store_true',
+                    help='Run only Part 1 while iterative reference refinement is being debugged')
 
 args = parser.parse_args()
 
@@ -87,12 +89,14 @@ class BurstSR_Test_Network():
         test_data_loader = DataLoader(test_dataset, batch_size=1)
         
         experiment_rows = []
+        csv_path = os.path.join(result_dir, 'per_burst.csv')
         
         for i, data in enumerate(test_data_loader):
 
             burst, labels, meta_info_burst, meta_info_gt, burst_name = data            
             meta_info_burst = convert_dict(meta_info_burst, burst.shape[0])
             
+            # Part 1: adaptive selection among original RAW reference frames.
             selections = select_available_references(burst)
             burst = burst.cuda()
             labels = labels.cuda()
@@ -108,12 +112,41 @@ class BurstSR_Test_Network():
                         outputs, selected_ref, burst, labels, self.shift_metrics, self.alignment_net)
                 corrected_gain = gain_by_ref[selected_ref]
                 experiment_rows.append({'burst_id': burst_name[0], 'selection_method': method,
+                                        'experiment_type': 'adaptive_reference_selection',
                                         'selected_reference_index': selected_ref,
-                                        'corrected_psnr_gain': corrected_gain})
+                                        'psnr_gain_vs_frame0': corrected_gain, 'alpha': '',
+                                        'evaluation_method': 'v2_reverse_shift_control'})
                 net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
-                cv2.imwrite(os.path.join(result_dir, f'{burst_name[0]}_{method}.png'), net_pred_np)
+                cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], method)), net_pred_np)
                 print(f'Burst {i}, {method}, reference {selected_ref}: '
                       f'v2 corrected PSNR gain {corrected_gain:+.3f} dB')
+
+            # Persist Part 1 before the optional/experimental Part 2 path.
+            write_experiment_csv(csv_path, experiment_rows)
+
+            # Part 2: iterative refinement in the original frame-0 viewpoint.
+            if not args.skip_algorithm3:
+                try:
+                    from reference_selection.algorithm3 import FINAL_ALPHA, build_synthetic_reference_burst
+
+                    with torch.no_grad():
+                        algorithm3_burst = build_synthetic_reference_burst(burst, outputs[0], FINAL_ALPHA)
+                        algorithm3_output = model(algorithm3_burst).clamp(0.0, 1.0)
+                        algorithm3_gain = evaluate_same_reference_pair(
+                            outputs[0], algorithm3_output, burst, labels, self.shift_metrics)
+                    experiment_rows.append({'burst_id': burst_name[0], 'selection_method': 'algorithm3',
+                                            'experiment_type': 'iterative_reference_refinement',
+                                            'selected_reference_index': '',
+                                            'psnr_gain_vs_frame0': algorithm3_gain, 'alpha': FINAL_ALPHA,
+                                            'evaluation_method': 'same_reference_pair'})
+                    net_pred_np = (algorithm3_output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
+                    cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], 'algorithm3')),
+                                net_pred_np)
+                    print(f'Burst {i}, algorithm3, synthetic reference alpha {FINAL_ALPHA}: '
+                          f'PSNR gain {algorithm3_gain:+.3f} dB')
+                    write_experiment_csv(csv_path, experiment_rows)
+                except Exception as error:
+                    print(f'Burst {i}, algorithm3 failed; Part 1 results were preserved: {error}')
             """
             burst = burst.cpu()
             output = output.cpu()
@@ -135,7 +168,7 @@ class BurstSR_Test_Network():
             cv2.imwrite('{}/{}'.format(result_dir, burst_name[0] +'.png'), output)
             """
         
-        write_experiment_csv(os.path.join(result_dir, 'per_burst.csv'), experiment_rows)
+        write_experiment_csv(csv_path, experiment_rows)
 
 if __name__ == '__main__':
     BurstSR_Test_Network(args).test()
