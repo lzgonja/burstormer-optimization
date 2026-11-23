@@ -282,7 +282,7 @@ def select_reference(burst: torch.Tensor, policy: str, margin: float = None) -> 
         sharp = frame_sharpness_smoothed(burst).tolist()
         return guarded_choice(dict(enumerate(sharp)), margin=GUARD_MARGIN if margin is None else margin)
     if policy == 'algorithm2':
-        return algorithm2.select_reference(burst, margin=algorithm2.MARGIN if margin is None else margin)
+        return algorithm2.select_reference_frame(burst, margin=algorithm2.MARGIN if margin is None else margin)
     raise ValueError(f'Unknown reference policy {policy}')
 
 

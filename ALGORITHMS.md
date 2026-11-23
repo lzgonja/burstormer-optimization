@@ -164,9 +164,10 @@ Tried and dropped:
 - Taking the cheapest frame after rejecting the default often picked frame 3 or 4, about 1 dB worse than frame 1.
 
 ### Implementation
-`Burst Super-resolution/reference_selection/algorithm2.py`, `select_reference(burst) -> int`. It takes a burst
-`[N, 4, H, W]` or `[1, N, 4, H, W]` (packed RGGB in [0, 1]), runs on CPU or GPU, and needs no network or ground
-truth. Parameters:
+`Burst Super-resolution/reference_selection/algorithm2.py`, `select_reference_frame(burst) -> int`, the same
+interface as algorithm 1. It takes a burst `(N, 4, H, W)` as a torch tensor or numpy array (packed RGGB in [0, 1];
+`(1, N, 4, H, W)` is also accepted) and returns the frame index as a Python int. A wrong shape, an empty burst or
+non-finite values raise `ValueError`. It runs on CPU or GPU and needs no network or ground truth. Parameters:
 
 | Parameter | Default | Meaning |
 |---|---|---|

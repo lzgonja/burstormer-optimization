@@ -43,6 +43,7 @@ arXiv:2201.07066, 2022.
 import math
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
 DEFAULT_REF = 0
@@ -52,15 +53,22 @@ MARGIN = 0.2    # chosen on clean dev bursts (score_ref_policies.py)
 _EPS = 1e-6
 
 
-def _as_frames(burst: torch.Tensor) -> torch.Tensor:
-    """Accept [N, 4, H, W] or [1, N, 4, H, W] packed RGGB in [0, 1]. Returns float [N, 4, H, W]."""
+def _as_frames(burst) -> torch.Tensor:
+    """Accept a torch tensor or numpy array of shape (N, 4, H, W), or (1, N, 4, H, W) as in the evaluation scripts,
+    packed RGGB in [0, 1]. Returns a float tensor (N, 4, H, W); the input is never modified. Raises ValueError on a
+    wrong shape, an empty burst or non-finite values, like algorithm 1."""
+    if not isinstance(burst, torch.Tensor):
+        burst = torch.from_numpy(np.array(burst, dtype=np.float32))  # copy, so the caller's array is untouched
     if burst.dim() == 5:
         if burst.shape[0] != 1:
             raise ValueError(f'Expected a single burst, got batch size {burst.shape[0]}')
         burst = burst[0]
-    if burst.dim() != 4 or burst.shape[1] != 4:
-        raise ValueError(f'Expected [N, 4, H, W] packed RGGB, got {tuple(burst.shape)}')
-    return burst.float()
+    if burst.dim() != 4 or burst.shape[0] == 0 or burst.shape[1] != 4:
+        raise ValueError(f'Expected burst shape (N, 4, H, W), got {tuple(burst.shape)}.')
+    burst = burst.float()
+    if not torch.isfinite(burst).all():
+        raise ValueError('Burst contains non-finite values.')
+    return burst
 
 
 def _phase_shifts(green: torch.Tensor, ref: int) -> torch.Tensor:
@@ -163,10 +171,11 @@ def choose_from_costs(costs: Dict[int, float], default: int = DEFAULT_REF, margi
 
 
 @torch.no_grad()
-def select_reference(burst: torch.Tensor, default: int = DEFAULT_REF, window: int = WINDOW,
-                     margin: float = MARGIN) -> int:
-    """Index of the reference frame for `burst` ([N, 4, H, W] or [1, N, 4, H, W], packed RGGB in [0, 1])."""
-    n = _as_frames(burst).shape[0]
-    if n == 1:
+def select_reference_frame(burst, default: int = DEFAULT_REF, window: int = WINDOW, margin: float = MARGIN) -> int:
+    """Select the reference frame of an input burst of shape (N, 4, H, W) (torch tensor or numpy array, packed RGGB
+    in [0, 1]); (1, N, 4, H, W) is also accepted. Same interface as algorithm1.select_reference_frame: returns the
+    frame index as a Python int in [0, N-1]. The keyword arguments are for the evaluation sweeps only."""
+    frames = _as_frames(burst)
+    if frames.shape[0] == 1:
         return 0
-    return choose_from_costs(frame_costs(burst, window), default=default, margin=margin)
+    return int(choose_from_costs(frame_costs(frames, window), default=default, margin=margin))

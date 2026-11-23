@@ -8,6 +8,7 @@ import sys
 import math
 import unittest
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -93,25 +94,43 @@ class TestAgreement(unittest.TestCase):
 
 class TestSelection(unittest.TestCase):
     def assert_switches(self, burst: torch.Tensor, msg: str, avoid=(0,)):
-        ref = alg2.select_reference(burst)
+        ref = alg2.select_reference_frame(burst)
         self.assertNotIn(ref, avoid, f'{msg}: kept frame {ref}, costs {alg2.frame_costs(burst)}')
         self.assertLess(ref, alg2.WINDOW)
 
     def test_clean_bursts_keep_default(self):
         for seed in range(6):
             burst, _ = make_burst(seed=seed)
-            self.assertEqual(alg2.select_reference(burst), alg2.DEFAULT_REF,
+            self.assertEqual(alg2.select_reference_frame(burst), alg2.DEFAULT_REF,
                              f'seed {seed}: costs {alg2.frame_costs(burst)}')
 
     def test_interface(self):
         burst, _ = make_burst(n=8)
-        ref = alg2.select_reference(burst[None])  # [1, N, 4, H, W] as in the evaluation scripts
+        ref = alg2.select_reference_frame(burst[None])  # [1, N, 4, H, W] as in the evaluation scripts
         self.assertIsInstance(ref, int)
         self.assertTrue(0 <= ref < 8)
-        self.assertEqual(alg2.select_reference(burst[:1]), 0)
-        self.assertEqual(alg2.select_reference(burst[:3]), alg2.select_reference(burst[:3]))
+        self.assertEqual(alg2.select_reference_frame(burst[:1]), 0)
+        self.assertEqual(alg2.select_reference_frame(burst[:3]), alg2.select_reference_frame(burst[:3]))
         with self.assertRaises(ValueError):
-            alg2.select_reference(torch.zeros(2, 3, 4, 8, 8))
+            alg2.select_reference_frame(torch.zeros(2, 3, 4, 8, 8))
+
+    def test_same_interface_as_algorithm1(self):
+        # Same inputs, outputs and errors as algorithm1.select_reference_frame
+        burst, gen = make_burst(seed=4)
+        burst[0] = add_noise(burst[0], 1e-2, gen)  # so the answer is not just the default frame
+        ref = alg2.select_reference_frame(burst)
+        self.assertIsInstance(ref, int)
+        array = burst.numpy().copy()
+        self.assertEqual(alg2.select_reference_frame(array), ref)  # numpy input gives the same answer
+        np.testing.assert_array_equal(array, burst.numpy())       # and is left unchanged
+        for bad in (torch.zeros(0, 4, 16, 16), torch.zeros(3, 3, 16, 16), torch.zeros(4, 16, 16)):
+            with self.assertRaises(ValueError):
+                alg2.select_reference_frame(bad)
+        for value in (float('nan'), float('inf')):
+            damaged = burst.clone()
+            damaged[2, 1, 5, 5] = value
+            with self.assertRaises(ValueError):
+                alg2.select_reference_frame(damaged)
 
     def test_blurred_default_is_replaced(self):
         for sigma in (1.0, 2.0):
@@ -151,13 +170,13 @@ class TestSelection(unittest.TestCase):
         # A damaged non-default frame alone does not cause a switch
         burst, gen = make_burst(seed=8)
         burst[2] = expose(burst[2], 0.125, gen)
-        self.assertEqual(alg2.select_reference(burst), 0)
+        self.assertEqual(alg2.select_reference_frame(burst), 0)
 
     def test_fallback_is_the_earliest_acceptable_frame(self):
         for seed in range(3):
             burst, gen = make_burst(seed=20 + seed)
             burst[0] = add_noise(burst[0], 1e-2, gen)
-            self.assertEqual(alg2.select_reference(burst), 1, f'seed {seed}: costs {alg2.frame_costs(burst)}')
+            self.assertEqual(alg2.select_reference_frame(burst), 1, f'seed {seed}: costs {alg2.frame_costs(burst)}')
 
     def test_choose_from_costs_rule(self):
         self.assertEqual(alg2.choose_from_costs({0: 1.10, 1: 1.0, 2: 1.0, 3: 0.9}, margin=0.15), 0)
