@@ -1,0 +1,20 @@
+40 bursts, PSNR on the region common to every image (62% of pixels). Penalty = PSNR(O_0) - PSNR(O_0 moved to frame k). 95% bootstrap over bursts.
+           ref  shift px  O_k~S_k dB  penalty          interval  real gain          interval  corrected          interval
+             0       0.0         nan   +0.000  [+0.000, +0.000]     +0.000  [+0.000, +0.000]     +0.000  [+0.000, +0.000]
+             1       8.2        40.7   +0.032  [-0.021, +0.098]     +0.147  [-0.082, +0.361]     +0.178  [-0.019, +0.383]
+             2      15.6        42.5   +0.171  [+0.069, +0.286]     +0.022  [-0.186, +0.224]     +0.193  [-0.021, +0.417]
+             3      20.0        42.3   +0.218  [+0.119, +0.325]     -0.091  [-0.311, +0.107]     +0.127  [-0.106, +0.353]
+             4      27.4        41.2   +0.436  [+0.268, +0.615]     -0.404  [-0.614, -0.218]     +0.032  [-0.187, +0.255]
+ probe_half_px       0.7               -0.012  [-0.029, +0.004]
+probe_whole_px      11.3               +0.142  [+0.065, +0.228]
+
+Reverse check: corrected gain estimated two ways (95% bootstrap over bursts)
+   ref  O_0 moved to k  O_k moved to 0  difference          interval  per-burst r
+     1          +0.178          +0.127      -0.052  [-0.112, +0.008]         0.96
+     2          +0.193          +0.182      -0.012  [-0.096, +0.067]         0.94
+     3          +0.127          +0.161      +0.034  [-0.041, +0.114]         0.95
+     4          +0.032          +0.111      +0.079  [-0.061, +0.235]         0.84
+
+Oracle gain over frame 0: measured +0.331 [0.18903154866338234, 0.490438037532074], corrected +0.426 [0.2565899992281586, 0.6129058055859574]
+Best frame after correction (frame:bursts): 0:11 1:8 2:8 3:6 4:7
+Wrote per_burst.csv
