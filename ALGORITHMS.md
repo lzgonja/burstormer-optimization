@@ -139,19 +139,62 @@ Describe the implementation and any important parameters.
 
 ---
 
-## Algorithm 3: TBD
+
+## Algorithm 3: Iterative Reference Frame Refinement
 
 **Contributor:** Victoria Kreinin
 
 ### Motivation
-Why might this approach identify a better reference frame?
+Traditional burst super-resolution methods use an image from the original burst as the reference frame. However, the initial reconstruction may be limited in recovering the scene details, as they may not be as clearly represented in the original reference frame.
+
+This approach investigates whether feeding the model's own reconstruction back into the network as a new reference can improve the subsequent reconstruction. The hypothesis is that the reconstructed image may provide a more informative reference than the original frame.
 
 ### Method
-Describe how the algorithm works and how it selects a frame.
+The algorithm uses an iterative, two-pass approach:
+
+1. Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
+
+2. Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
+
+3. Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optional: blend the synthetic reference with the original frame 0 using a blending parameter α:
+
+reference = α × synthetic_reference + (1 − α) × original_reference
+
+4. Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
+
+5. Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
 
 ### Implementation
-Describe the implementation and any important parameters.
+The algorithm uses an iterative, two-pass approach:
+
+Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
+
+Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
+
+Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optionally, blend the synthetic reference with the original frame 0 using a blending parameter α:
+
+reference = α × synthetic_reference + (1 − α) × original_reference
+
+Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
+
+Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
+
+### Results
+The algorithm uses an iterative, two-pass approach:
+
+Initial reconstruction: Feed the original 14-frame burst into Burstormer using the original frame 0 as the reference. Generate an initial 640 × 640 RGB reconstruction.
+
+Synthetic reference generation: Convert the RGB reconstruction into an approximate 4-channel, 80 × 80 packed RGGB pseudo-RAW image. This conversion involves downsampling the RGB output, recreating the RGGB Bayer pattern, and packing the resulting mosaic into four channels.
+
+Reference replacement: Replace frame 0 in a copy of the original burst with the synthetic pseudo-RAW reference. Optionally, blend the synthetic reference with the original frame 0 using a blending parameter α:
+
+reference = α × synthetic_reference + (1 − α) × original_reference
+
+Iterative reconstruction: Feed the modified burst into Burstormer for a second reconstruction. The remaining 13 original frames are kept unchanged.
+
+Evaluation: Compare the second reconstruction against the baseline using PSNR, SSIM, and LPIPS. Both predictions are evaluated using the original burst to maintain consistent reference-frame colour matching.
 
 ### References
-- TBD
+Chitwan Saharia, Jonathan Ho, William Chan, Tim Salimans, David J. Fleet, Mohammad Norouzi. 2021-06-30. Image Super-Resolution via Iterative Refinement. https://searcharxiv.org/abs/2104.07636
+Bannore, V., & Swierkowski, L. (2006). An iterative approach to image SUPER-RESOLUTION. International Federation of Info Processing. https://opendl.ifip-tc6.org/db/conf/ifip12/iip2006/BannoreS06.pdf 
 
