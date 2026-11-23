@@ -9,6 +9,7 @@ import argparse
 import numpy as np
 import torch.nn.functional as F
 import torchvision
+import random
 
 ######################################## Model and Dataset ########################################################
 from Network_Real_burstSR import Base_Model
@@ -21,11 +22,14 @@ from datasets.burstsr_dataset import BurstSRDataset
 from utils.data_format_utils import convert_dict
 from utils.postprocessing_functions import BurstSRPostProcess
 
-from utils.metrics import AlignedPSNR, AlignedSSIM, AlignedLPIPS
 from pwcnet.pwcnet import PWCNet
 
 import data_processing.camera_pipeline as rgb2raw
 from data_processing.camera_pipeline import *
+from reference_frame_sweep import FastAlignedMetrics
+from reference_selection import (reconstruct_selected_references, select_available_references,
+                                 write_experiment_csv)
+from shift_control import evaluate_reference_pair
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -58,10 +62,8 @@ class BurstSR_Test_Network():
         PWCNet_weight_PATH = './pwcnet/pwcnet-network-default.pth'        
         alignment_net = PWCNet(load_pretrained=True, weights_path=PWCNet_weight_PATH)
         alignment_net = alignment_net.cuda()
-        
-        self.aligned_psnr_fn = AlignedPSNR(alignment_net=alignment_net)
-        self.aligned_ssim_fn = AlignedSSIM(alignment_net=alignment_net)
-        self.aligned_lpips_fn = AlignedLPIPS(alignment_net=alignment_net)
+        self.alignment_net = alignment_net
+        self.shift_metrics = FastAlignedMetrics(alignment_net)
         
     def test(self):               
         # Postprocessing function to obtain sRGB images
@@ -79,40 +81,39 @@ class BurstSR_Test_Network():
         
         ################## DATA Loaders ########################################
         
-        test_dataset = BurstSRDataset(root="./burstsr_dataset",  split='val', burst_size=14, crop_sz=80, random_flip=False)
+        # Selection indices must refer to the original RAW capture order.
+        test_dataset = BurstSRDataset(root="./burstsr_dataset", split='val', burst_size=14, crop_sz=80,
+                                      random_flip=False, ref_id=0, shuffle_frames=False)
         test_data_loader = DataLoader(test_dataset, batch_size=1)
         
-        PSNR = []
-        LPIPS = []
-        SSIM = []
+        experiment_rows = []
         
         for i, data in enumerate(test_data_loader):
 
             burst, labels, meta_info_burst, meta_info_gt, burst_name = data            
             meta_info_burst = convert_dict(meta_info_burst, burst.shape[0])
             
-            burst_rgb = rgb2raw.demosaic(burst[0])            
-            burst_rgb = burst_rgb.view(-1, *burst_rgb.shape[-3:])
-            burst_rgb = F.interpolate(burst_rgb, scale_factor=4, mode='bilinear', align_corners=True)
-            
+            selections = select_available_references(burst)
             burst = burst.cuda()
             labels = labels.cuda()
-            output = labels*0
-            
             with torch.no_grad():
-                output = model(burst)
-                output = output.clamp(0.0, 1.0)
-            
-            PSNR_temp = self.aligned_psnr_fn(output, labels, burst).cpu().numpy()            
-            PSNR.append(PSNR_temp)
-            
-            LPIPS_temp = self.aligned_lpips_fn(output, labels, burst).cpu().detach().numpy()
-            LPIPS.append(LPIPS_temp)
-            
-            SSIM_temp = self.aligned_ssim_fn(output, labels, burst).cpu().numpy()
-            SSIM.append(SSIM_temp)
-            
-            print('Evaluation Measures for Burst {:d} ::: PSNR is {:0.3f}, SSIM is {:0.3f} and LPIPS is {:0.3f} \n'.format(i, PSNR_temp, SSIM_temp, LPIPS_temp))
+                outputs = reconstruct_selected_references(burst, model, selections)
+                outputs = {reference: output.clamp(0.0, 1.0) for reference, output in outputs.items()}
+
+            gain_by_ref = {}
+            for method, selected_ref in selections.items():
+                output = outputs[selected_ref]
+                if selected_ref not in gain_by_ref:
+                    gain_by_ref[selected_ref] = evaluate_reference_pair(
+                        outputs, selected_ref, burst, labels, self.shift_metrics, self.alignment_net)
+                corrected_gain = gain_by_ref[selected_ref]
+                experiment_rows.append({'burst_id': burst_name[0], 'selection_method': method,
+                                        'selected_reference_index': selected_ref,
+                                        'corrected_psnr_gain': corrected_gain})
+                net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
+                cv2.imwrite(os.path.join(result_dir, f'{burst_name[0]}_{method}.png'), net_pred_np)
+                print(f'Burst {i}, {method}, reference {selected_ref}: '
+                      f'v2 corrected PSNR gain {corrected_gain:+.3f} dB')
             """
             burst = burst.cpu()
             output = output.cpu()
@@ -134,14 +135,7 @@ class BurstSR_Test_Network():
             cv2.imwrite('{}/{}'.format(result_dir, burst_name[0] +'.png'), output)
             """
         
-        Average_PSNR = sum(PSNR)/len(PSNR)
-        Average_SSIM = sum(SSIM)/len(SSIM)
-        Average_LPIPS = sum(LPIPS)/len(LPIPS)
-        average_eval_par = '\nAverage Evaluation Measures ::: PSNR is {:0.3f}, SSIM is {:0.3f} and LPIPS is {:0.3f}\n'.format(Average_PSNR, Average_SSIM, Average_LPIPS)
-                        
-        print(average_eval_par)
+        write_experiment_csv(os.path.join(result_dir, 'per_burst.csv'), experiment_rows)
 
-
-BurstSR_Test_Network(args).test()
-
-
+if __name__ == '__main__':
+    BurstSR_Test_Network(args).test()

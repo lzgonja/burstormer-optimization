@@ -4,6 +4,28 @@
 
 [![paper](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/pdf/2304.01194.pdf)
 
+## Adaptive Reference-Frame Selection for Burst Super-Resolution
+
+*University of Toronto — CSC2529: Computational Imaging, Fall 2026*
+
+This project extends Burstormer to investigate whether adaptive reference-frame selection can improve burst super-resolution. While the original model uses the first frame of each burst as its reference, we explore three selection algorithms that choose a reference based on information from the input burst.
+
+### Approach
+
+For each burst, we compare the original fixed frame-0 baseline against our adaptive reference-selection methods. Each selected reference is moved to the first position before being passed into Burstormer, without modifying the original model architecture.
+
+To evaluate reconstruction quality, we use a shift-control method that accounts for positional bias when comparing different reference frames. Performance is measured as the corrected PSNR gain relative to frame 0.
+
+### Running the Evaluation
+
+The automated evaluation pipeline is implemented in `Burst Super-resolution/Track_2_evaluation.py`. It requires the BurstSR dataset, a trained Burstormer checkpoint, and a compatible CUDA environment.
+
+Outputs are saved under `Results/Real/Testing Phase/`:
+
+- **Reconstructed images:** Individual 16-bit PNGs for each burst and selection method.
+- **`per_burst.csv`:** Selected reference indices and corrected PSNR gains relative to frame 0.
+
+
 #### News
 - **Feb 27, 2023:** Paper accepted at CVPR 2023 :tada:
 

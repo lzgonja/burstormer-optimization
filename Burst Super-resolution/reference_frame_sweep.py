@@ -33,6 +33,7 @@ from Network_Real_burstSR import Base_Model
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from ref_selection import GUARD_MARGIN, guarded_choice
+from reference_selection import reorder_burst
 import utils.spatial_color_alignment as sca_utils
 from utils.metrics import make_patches
 from utils.warp import warp
@@ -264,8 +265,7 @@ def bilinear_reference(burst: torch.Tensor) -> torch.Tensor:
 
 def reorder(burst: torch.Tensor, ref: int) -> torch.Tensor:
     """Put frame `ref` first and keep the remaining frames in capture order."""
-    perm = [ref] + [i for i in range(burst.shape[1]) if i != ref]
-    return burst[:, perm]
+    return reorder_burst(burst, ref)
 
 
 def select_reference(burst: torch.Tensor, policy: str, margin: float = GUARD_MARGIN) -> int:

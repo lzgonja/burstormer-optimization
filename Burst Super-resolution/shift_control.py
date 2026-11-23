@@ -57,6 +57,49 @@ from shift_geometry import (MODELS, PAD, Geometry, coverage, estimate_geometry, 
 PROBES = {'probe_half_px': (0.5, 0.5), 'probe_whole_px': (8.0, 8.0)}
 
 
+def evaluate_reference_pair(outputs, reference, burst, gt, metrics, flow_net, geometry='homography', factor=8,
+                            colour_ref='moved', fill='target'):
+    """Return v2 reverse-corrected PSNR gain over frame 0 on one pair-valid region.
+
+    This is the default reverse-correction path from :func:`main`, exposed so an
+    experiment can reuse its reconstructions instead of running a separate sweep.
+    """
+    if reference == 0:
+        return 0.0
+
+    o0 = outputs[0]
+    base_al = metrics.align_patches(o0, gt, burst)
+    selected = outputs[reference]
+    fwd_geo = estimate_geometry(o0, selected, geometry, flow_net)
+    rev_geo = Geometry(-fwd_geo.shift) if geometry == 'translation' else \
+        estimate_geometry(selected, o0, geometry, flow_net)
+    target = fill == 'target'
+    fwd_img = warp_image(o0, fwd_geo, factor, fill=selected if target else None)
+    rev_img = warp_image(selected, rev_geo, factor, fill=o0 if target else None)
+    burst_ref = reorder(burst, reference)
+    real_al = metrics.align_patches(selected, gt, burst_ref)
+    moved_ref = colour_ref == 'moved'
+    fwd_al = metrics.align_patches(
+        fwd_img, gt,
+        move_reference(burst, burst[:, 0], fwd_geo, burst[:, reference]) if moved_ref else burst_ref)
+    rev_al = metrics.align_patches(
+        rev_img, gt,
+        move_reference(burst, burst[:, reference], rev_geo, burst[:, 0]) if moved_ref else burst)
+
+    masks = []
+    if target:
+        h, w = o0.shape[-2:]
+        masks.append(metric_patch_masks(coverage(fwd_geo, h, w, o0.device) &
+                                        coverage(rev_geo, h, w, o0.device)))
+    regions = [torch.stack(
+        [al[p]['valid'] & al[p]['in_view'] for al in (base_al, real_al, fwd_al, rev_al)] +
+        [mask[p].to(base_al[p]['valid'].device) for mask in masks]
+    ).all(dim=0) for p in range(len(base_al))]
+    psnr_frame0 = metrics.score(base_al, regions=regions)[0]
+    psnr_reverse = metrics.score(rev_al, regions=regions)[0]
+    return psnr_reverse - psnr_frame0
+
+
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
     rng = np.random.default_rng(seed)
     means = x[rng.integers(0, len(x), (n, len(x)))].mean(axis=1)
