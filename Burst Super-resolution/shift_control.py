@@ -13,15 +13,22 @@ separates that penalty from real reconstruction quality:
        with it as its colour reference (--colour_ref moved), so that only the position changes.
     3. Reverse estimate (the default, --estimator reverse): move O_k back to frame 0's position and score it as
        reference 0. Frame k's own reconstruction is then scored without its position, so
-           corrected gain = PSNR(O_k moved to frame 0, as ref 0) - PSNR(O_0, as ref 0).
+           corrected gain = score(O_k moved to frame 0, as ref 0) - score(O_0, as ref 0).
     4. Forward estimate (the original control): move O_0 to frame k's position and score it as reference k. Its loss
        is the penalty for position, measured on frame 0's content, and is added back to frame k's real gain:
-           corrected gain = PSNR(O_k, as ref k) - PSNR(O_0 moved to frame k, as ref k).
+           corrected gain = score(O_k, as ref k) - score(O_0 moved to frame k, as ref k).
 
 Which estimate is right was measured with known answers (shift_control_benchmark.py,
 docs/SHIFT_CONTROL_VALIDATION.md). On 9 bursts with shifts up to 110 px, the reverse estimate is accurate to
 0.068 dB RMS (bias -0.011 dB). The forward estimate is off by 0.385 dB RMS when frame k's content differs from frame
 0's, because the penalty depends on the content being moved. Both are always computed. `penalty` is corrected gain minus measured gain.
+(The benchmark numbers above are for PSNR; run it to check SSIM and LPIPS.)
+
+Metrics: every image is scored with all three BurstSR metrics (PSNR, SSIM, LPIPS) on the same pixels, and every
+score, gain, estimate and penalty is reported for each. PSNR keeps the original column names; the derived SSIM and
+LPIPS columns carry an `ssim_` or `lpips_` prefix. LPIPS is lower-is-better, so its gains are reductions (frame 0
+minus frame k): for every metric a positive gain means frame k is better, and a positive penalty means its position
+costs it score.
 
 Region (--region): `pair` scores frame k and frame 0 on the pixels valid and in view for every image of that
 comparison, so a frame's result does not depend on which other frames are in the run. `all` uses the pixels common
@@ -55,6 +62,17 @@ from shift_geometry import (MODELS, PAD, Geometry, coverage, estimate_geometry, 
                             move_reference, shift_image, translation, warp_image)
 
 PROBES = {'probe_half_px': (0.5, 0.5), 'probe_whole_px': (8.0, 8.0)}
+
+# The three BurstSR metrics, in the order FastAlignedMetrics.score returns them
+METRICS = ('psnr', 'ssim', 'lpips')
+SIGN = {'psnr': 1.0, 'ssim': 1.0, 'lpips': -1.0}  # LPIPS is lower-is-better: its gain is a reduction
+LABELS = {'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}
+DECIMALS = {'psnr': 3, 'ssim': 4, 'lpips': 4}
+
+
+def col(metric: str, name: str) -> str:
+    """Name of a derived column: unprefixed for PSNR (the original names), prefixed for SSIM and LPIPS."""
+    return name if metric == 'psnr' else f'{metric}_{name}'
 
 
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
@@ -107,9 +125,11 @@ def main() -> None:
 
     rows: List[Dict] = []
     path = os.path.join(args.out_dir, 'per_burst.csv')
-    fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'residual_max_px', 'psnr_frame0', 'psnr_real', 'psnr_forward',
-              'psnr_reverse', 'gain_real', 'gain_forward', 'gain_reverse', 'gain_corrected', 'penalty',
-              'fidelity_forward', 'fidelity_reverse', 'geometry_fallback', 'common_frac']
+    fields = ['burst', 'ref', 'shift_dy', 'shift_dx', 'residual_max_px']
+    for m in METRICS:
+        fields += [f'{m}_frame0', f'{m}_real', f'{m}_forward', f'{m}_reverse'] + \
+            [col(m, c) for c in ('gain_real', 'gain_forward', 'gain_reverse', 'gain_corrected', 'penalty')]
+    fields += ['fidelity_forward', 'fidelity_reverse', 'geometry_fallback', 'common_frac']
     with open(path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -169,36 +189,43 @@ def main() -> None:
                 else:
                     regions[k] = region([real_al[0], real_al[k], fwd_al[k], rev_al[k]], [cover[k]] if k in cover else [])
 
-            def psnr(al, k):
-                return metrics.score(al, regions=regions[k])[0]
+            def scores(al, k):
+                return dict(zip(METRICS, metrics.score(al, regions=regions[k])))
 
             for k in refs:
                 frac = float(np.mean([c.float().mean().item() for c in regions[k]]))
-                p0, pk = psnr(real_al[0], k), psnr(real_al[k], k)
-                row = {'burst': name, 'ref': k, 'psnr_frame0': p0, 'psnr_real': pk, 'gain_real': pk - p0,
-                       'common_frac': frac}
+                s0, sk = scores(real_al[0], k), scores(real_al[k], k)
+                row = {'burst': name, 'ref': k, 'common_frac': frac}
                 if k == 0:
-                    row.update({'shift_dy': 0.0, 'shift_dx': 0.0, 'residual_max_px': 0.0, 'psnr_forward': p0,
-                                'psnr_reverse': p0, 'gain_forward': 0.0, 'gain_reverse': 0.0})
+                    sf = sr = s0
+                    row.update({'shift_dy': 0.0, 'shift_dx': 0.0, 'residual_max_px': 0.0})
                 else:
-                    pf, pr = psnr(fwd_al[k], k), psnr(rev_al[k], k)
+                    sf, sr = scores(fwd_al[k], k), scores(rev_al[k], k)
                     margin = int(math.ceil(fwd_geo[k].shift.abs().max().item() + fwd_geo[k].max_residual())) + 8
                     row.update({'shift_dy': fwd_geo[k].shift[0].item(), 'shift_dx': fwd_geo[k].shift[1].item(),
-                                'residual_max_px': fwd_geo[k].max_residual(), 'psnr_forward': pf, 'psnr_reverse': pr,
-                                'gain_forward': pk - pf, 'gain_reverse': pr - p0,
+                                'residual_max_px': fwd_geo[k].max_residual(),
                                 'fidelity_forward': fidelity(fwd_img[k], outputs[k], margin),
                                 'fidelity_reverse': fidelity(rev_img[k], o0, margin),
                                 'geometry_fallback': int(fwd_geo[k].info.get('fallback', False)) +
                                 int(rev_geo[k].info.get('fallback', False))})
-                row['gain_corrected'] = row[f'gain_{args.estimator}']
-                row['penalty'] = row['gain_corrected'] - row['gain_real']
+                for m in METRICS:
+                    gains = {'real': SIGN[m] * (sk[m] - s0[m]),
+                             'forward': SIGN[m] * (sk[m] - sf[m]) if k else 0.0,
+                             'reverse': SIGN[m] * (sr[m] - s0[m]) if k else 0.0}
+                    row.update({f'{m}_frame0': s0[m], f'{m}_real': sk[m], f'{m}_forward': sf[m],
+                                f'{m}_reverse': sr[m]})
+                    row.update({col(m, f'gain_{g}'): v for g, v in gains.items()})
+                    row[col(m, 'gain_corrected')] = gains[args.estimator]
+                    row[col(m, 'penalty')] = gains[args.estimator] - gains['real']
                 rows.append(row)
                 writer.writerow(row)
             for p in PROBES:
-                p0 = psnr(real_al[0], p)
-                row = {'burst': name, 'ref': p, 'psnr_frame0': p0, 'psnr_forward': psnr(probe_al[p], p),
-                       'penalty': p0 - psnr(probe_al[p], p),
+                s0, sp = scores(real_al[0], p), scores(probe_al[p], p)
+                row = {'burst': name, 'ref': p,
                        'common_frac': float(np.mean([c.float().mean().item() for c in regions[p]]))}
+                for m in METRICS:
+                    row.update({f'{m}_frame0': s0[m], f'{m}_forward': sp[m],
+                                col(m, 'penalty'): SIGN[m] * (s0[m] - sp[m])})
                 rows.append(row)
                 writer.writerow(row)
             f.flush()
@@ -211,61 +238,73 @@ def summarise(rows: List[Dict], refs: List[int], args, path: str) -> None:
     by_ref = {k: [r for r in rows if r['ref'] == k] for k in refs + list(PROBES)}
     n_bursts = len(by_ref[0])
     region_text = 'common to every image' if args.region == 'all' else 'common to each comparison'
-    print(f'\n{n_bursts} bursts. Geometry {args.geometry}, {args.estimator} estimate, PSNR on the pixels '
-          f'{region_text} ({np.mean([r["common_frac"] for r in rows]):.0%}). Penalty = corrected - measured gain. '
-          f'95% bootstrap over bursts.')
-    print(f'{"ref":>14}{"shift px":>10}{"fidelity":>10}{"penalty":>9}{"interval":>18}{"measured":>10}{"interval":>18}'
-          f'{"corrected":>11}{"interval":>18}')
-    summary = []
-    for k in refs:
-        sel = by_ref[k]
-        pen, gr, gc = (np.array([r[c] for r in sel]) for c in ('penalty', 'gain_real', 'gain_corrected'))
-        sh = np.mean([math.hypot(r['shift_dy'], r['shift_dx']) for r in sel])
-        fid = np.mean([r[f'fidelity_{args.estimator}'] for r in sel]) if k else float('nan')
-        s = {'ref': k, 'mean_shift_px': sh, 'fidelity': fid, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen),
-             'gain_real': gr.mean(), 'gain_real_ci': bootstrap(gr), 'gain_corrected': gc.mean(),
-             'gain_corrected_ci': bootstrap(gc)}
-        if k:
-            gf = np.array([r['gain_forward'] for r in sel])
-            gv = np.array([r['gain_reverse'] for r in sel])
-            s.update({'gain_forward': gf.mean(), 'gain_reverse': gv.mean(), 'reverse_minus_forward': (gv - gf).mean(),
-                      'reverse_minus_forward_ci': bootstrap(gv - gf),
-                      'per_burst_r': float(np.corrcoef(gf, gv)[0, 1]) if len(sel) > 2 else float('nan')})
-        summary.append(s)
-        print(f'{k:>14}{sh:>10.1f}{fid:>10.1f}{s["penalty"]:>+9.3f}{"[%+.3f, %+.3f]" % tuple(s["penalty_ci"]):>18}'
-              f'{s["gain_real"]:>+10.3f}{"[%+.3f, %+.3f]" % tuple(s["gain_real_ci"]):>18}'
-              f'{s["gain_corrected"]:>+11.3f}{"[%+.3f, %+.3f]" % tuple(s["gain_corrected_ci"]):>18}')
-    for p in PROBES:
-        pen = np.array([r['penalty'] for r in by_ref[p]])
-        summary.append({'ref': p, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen)})
-        print(f'{p:>14}{math.hypot(*PROBES[p]):>10.1f}{"":>10}{pen.mean():>+9.3f}'
-              f'{"[%+.3f, %+.3f]" % tuple(bootstrap(pen)):>18}')
-
-    print('\nForward vs reverse estimate of the corrected gain (diagnostic; the benchmark favours reverse)')
-    print(f'{"ref":>6}{"forward":>10}{"reverse":>10}{"difference":>12}{"interval":>18}{"per-burst r":>13}')
-    for s in summary:
-        if isinstance(s['ref'], int) and s['ref'] > 0:
-            print(f'{s["ref"]:>6}{s["gain_forward"]:>+10.3f}{s["gain_reverse"]:>+10.3f}'
-                  f'{s["reverse_minus_forward"]:>+12.3f}{"[%+.3f, %+.3f]" % tuple(s["reverse_minus_forward_ci"]):>18}'
-                  f'{s["per_burst_r"]:>13.2f}')
-
     bursts = sorted({r['burst'] for r in rows})
     per = {(r['burst'], r['ref']): r for r in rows if r['ref'] in refs}
-    oracle_real = np.array([max(per[(b, k)]['gain_real'] for k in refs) for b in bursts])
-    oracle_corr = np.array([max(per[(b, k)]['gain_corrected'] for k in refs) for b in bursts])
-    print(f'\nBest frame per burst, gain over frame 0: measured {oracle_real.mean():+.3f} '
-          f'[{bootstrap(oracle_real)[0]:+.3f}, {bootstrap(oracle_real)[1]:+.3f}], corrected {oracle_corr.mean():+.3f} '
-          f'[{bootstrap(oracle_corr)[0]:+.3f}, {bootstrap(oracle_corr)[1]:+.3f}]')
-    best = [max(refs, key=lambda k: per[(b, k)]['gain_corrected']) for b in bursts]
-    print('Best frame after correction (frame:bursts): ' + ' '.join(f'{k}:{best.count(k)}' for k in refs))
+    print(f'\n{n_bursts} bursts. Geometry {args.geometry}, {args.estimator} estimate, scored on the pixels '
+          f'{region_text} ({np.mean([r["common_frac"] for r in rows]):.0%}). Penalty = corrected - measured gain. '
+          f'95% bootstrap over bursts. A positive gain means frame k is better (for LPIPS: lower).')
+    summary = []
+    for m in METRICS:
+        d = DECIMALS[m]
 
+        def num(x, w=0):
+            return f'{x:>+{w}.{d}f}'
+
+        def ci(c, w=0):
+            return f'{"[%+.*f, %+.*f]" % (d, c[0], d, c[1]):>{w}}'
+
+        print(f'\n=== {LABELS[m]} ===')
+        print(f'{"ref":>14}{"shift px":>10}{"fidelity":>10}{"penalty":>10}{"interval":>20}{"measured":>10}'
+              f'{"interval":>20}{"corrected":>11}{"interval":>20}')
+        rows_m = []
+        for k in refs:
+            sel = by_ref[k]
+            pen, gr, gc = (np.array([r[col(m, c)] for r in sel]) for c in ('penalty', 'gain_real', 'gain_corrected'))
+            sh = np.mean([math.hypot(r['shift_dy'], r['shift_dx']) for r in sel])
+            fid = np.mean([r[f'fidelity_{args.estimator}'] for r in sel]) if k else float('nan')
+            s = {'metric': m, 'ref': k, 'mean_shift_px': sh, 'fidelity': fid, 'penalty': pen.mean(),
+                 'penalty_ci': bootstrap(pen), 'gain_real': gr.mean(), 'gain_real_ci': bootstrap(gr),
+                 'gain_corrected': gc.mean(), 'gain_corrected_ci': bootstrap(gc)}
+            if k:
+                gf = np.array([r[col(m, 'gain_forward')] for r in sel])
+                gv = np.array([r[col(m, 'gain_reverse')] for r in sel])
+                s.update({'gain_forward': gf.mean(), 'gain_reverse': gv.mean(),
+                          'reverse_minus_forward': (gv - gf).mean(), 'reverse_minus_forward_ci': bootstrap(gv - gf),
+                          'per_burst_r': float(np.corrcoef(gf, gv)[0, 1]) if len(sel) > 2 else float('nan')})
+            rows_m.append(s)
+            print(f'{k:>14}{sh:>10.1f}{fid:>10.1f}{num(s["penalty"], 10)}{ci(s["penalty_ci"], 20)}'
+                  f'{num(s["gain_real"], 10)}{ci(s["gain_real_ci"], 20)}'
+                  f'{num(s["gain_corrected"], 11)}{ci(s["gain_corrected_ci"], 20)}')
+        for p in PROBES:
+            pen = np.array([r[col(m, 'penalty')] for r in by_ref[p]])
+            rows_m.append({'metric': m, 'ref': p, 'penalty': pen.mean(), 'penalty_ci': bootstrap(pen)})
+            print(f'{p:>14}{math.hypot(*PROBES[p]):>10.1f}{"":>10}{num(pen.mean(), 10)}{ci(bootstrap(pen), 20)}')
+
+        print(f'\nForward vs reverse estimate of the corrected {m.upper()} gain '
+              f'(diagnostic; the benchmark favours reverse)')
+        print(f'{"ref":>6}{"forward":>10}{"reverse":>10}{"difference":>12}{"interval":>20}{"per-burst r":>13}')
+        for s in rows_m:
+            if isinstance(s['ref'], int) and s['ref'] > 0:
+                print(f'{s["ref"]:>6}{num(s["gain_forward"], 10)}{num(s["gain_reverse"], 10)}'
+                      f'{num(s["reverse_minus_forward"], 12)}{ci(s["reverse_minus_forward_ci"], 20)}'
+                      f'{s["per_burst_r"]:>13.2f}')
+
+        oracle_real = np.array([max(per[(b, k)][col(m, 'gain_real')] for k in refs) for b in bursts])
+        oracle_corr = np.array([max(per[(b, k)][col(m, 'gain_corrected')] for k in refs) for b in bursts])
+        print(f'\nBest frame per burst, {m.upper()} gain over frame 0: measured {num(oracle_real.mean())} '
+              f'{ci(bootstrap(oracle_real))}, corrected {num(oracle_corr.mean())} {ci(bootstrap(oracle_corr))}')
+        best = [max(refs, key=lambda k: per[(b, k)][col(m, 'gain_corrected')]) for b in bursts]
+        print('Best frame after correction (frame:bursts): ' + ' '.join(f'{k}:{best.count(k)}' for k in refs))
+        rows_m.append({'metric': m, 'ref': 'oracle_measured', 'gain_real': oracle_real.mean()})
+        rows_m.append({'metric': m, 'ref': 'oracle_corrected', 'gain_corrected': oracle_corr.mean()})
+        summary += rows_m
+
+    keys = ['metric', 'ref'] + sorted({k for s in summary for k in s} - {'metric', 'ref'})
     with open(os.path.join(args.out_dir, 'summary.csv'), 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=sorted({k for s in summary for k in s}))
+        writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         for s in summary:
-            writer.writerow({k: (' '.join(f'{x:.4f}' for x in v) if isinstance(v, list) else v) for k, v in s.items()})
-        writer.writerow({'ref': 'oracle_measured', 'gain_real': oracle_real.mean()})
-        writer.writerow({'ref': 'oracle_corrected', 'gain_corrected': oracle_corr.mean()})
+            writer.writerow({k: (' '.join(f'{x:.5f}' for x in v) if isinstance(v, list) else v) for k, v in s.items()})
     print(f'Wrote {path}')
 
 
