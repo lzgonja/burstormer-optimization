@@ -42,21 +42,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from Network_Real_burstSR import Base_Model  # noqa: F401 (used by load_model)
-from datasets.burstsr_dataset import BurstSRDataset
-from pwcnet.pwcnet import PWCNet
-from reference_frame_sweep import (
-    FastAlignedMetrics,
-    load_model,
-    select_bursts,
-)
-from utils.metrics import AlignedPred
-from utils.postprocessing_functions import process_burstsr_image_rgb
-
-
 NUM_FRAMES = 14
 PACKED_SIZE = 80
 MOSAIC_SIZE = PACKED_SIZE * 2
+FINAL_ALPHA = 0.25
 
 
 def rgb_output_to_packed_rggb(
@@ -118,6 +107,22 @@ def rgb_output_to_packed_rggb(
     return packed.clamp(0.0, 1.0), rgb_small.clamp(0.0, 1.0)
 
 
+def build_synthetic_reference_burst(
+    original_burst: torch.Tensor,
+    frame0_output: torch.Tensor,
+    alpha: float = FINAL_ALPHA,
+) -> torch.Tensor:
+    """Replace only frame 0 with a fixed blend of it and the reconstructed pseudo-RAW reference."""
+    if original_burst.ndim != 5 or original_burst.shape[0] != 1 or original_burst.shape[1] != NUM_FRAMES:
+        raise ValueError(f"Expected original burst [1, 14, 4, H, W], got {tuple(original_burst.shape)}")
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be between 0 and 1.")
+    synthetic_raw, _ = rgb_output_to_packed_rggb(frame0_output, packed_size=original_burst.shape[-1])
+    modified = original_burst.clone()
+    modified[:, 0] = (alpha * synthetic_raw + (1.0 - alpha) * original_burst[:, 0]).clamp(0.0, 1.0)
+    return modified
+
+
 def save_rgb_tensor(tensor: torch.Tensor, path: str) -> None:
     """Save a raw [1,3,H,W] RGB tensor as an 8-bit PNG (not evaluation-colour-matched)."""
     image = (
@@ -137,6 +142,8 @@ def to_srgb(im: torch.Tensor, meta: dict, norm: float) -> np.ndarray:
     Same display conversion used by visualize_reference_frames.py:
     linear camera RGB -> repository post-processing -> uint8 BGR.
     """
+    from utils.postprocessing_functions import process_burstsr_image_rgb
+
     rgb = process_burstsr_image_rgb(
         im.cpu(),
         meta,
@@ -156,7 +163,7 @@ def save_aligned_visualization(
     prediction: torch.Tensor,
     labels: torch.Tensor,
     original_burst: torch.Tensor,
-    aligner: AlignedPred,
+    aligner: "AlignedPred",
     meta_gt: dict,
     norm: float,
     output_path: str,
@@ -191,6 +198,10 @@ def save_aligned_visualization(
 
 
 def main() -> None:
+    from datasets.burstsr_dataset import BurstSRDataset
+    from pwcnet.pwcnet import PWCNet
+    from reference_frame_sweep import FastAlignedMetrics, load_model, select_bursts
+    from utils.metrics import AlignedPred
     parser = argparse.ArgumentParser(
         description="Test iterative synthetic-reference refinement with Burstormer"
     )
@@ -429,13 +440,7 @@ def main() -> None:
             # ------------------------- PASS 2 -------------------------
             # Replace only frame 0. The other 13 original frames are unchanged.
             for alpha in args.alphas:
-                blended_reference = (
-                    alpha * synthetic_raw
-                    + (1.0 - alpha) * original_burst[:, 0]
-                ).clamp(0.0, 1.0)
-
-                iterative_burst = original_burst.clone()
-                iterative_burst[:, 0] = blended_reference
+                iterative_burst = build_synthetic_reference_burst(original_burst, baseline_output, alpha)
 
                 t1 = time.time()
                 with torch.inference_mode():
@@ -495,7 +500,7 @@ def main() -> None:
                     f"({pass2_seconds:.1f}s)"
                 )
 
-                del iterative_burst, iterative_output, blended_reference
+                del iterative_burst, iterative_output
                 torch.cuda.empty_cache()
 
             print(f"  Visual comparison saved to: {comparison_folder}")
