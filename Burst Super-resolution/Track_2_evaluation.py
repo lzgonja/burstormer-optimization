@@ -47,7 +47,8 @@ set_seed(50)
 parser = argparse.ArgumentParser(description='Real burst super-resolution using Burstormer')
 
 parser.add_argument('--result_dir', default='./Results/Real/', type=str, help='Directory for results')
-parser.add_argument('--weights', default='./Trained_models/Real/model_best.pth', type=str, help='Path to pre-trained weights')
+parser.add_argument('--weights', default='./Trained_models/Real/burstormer_burstsr_train.pth', type=str,
+                    help='Burstormer weights (default: the BurstSR-trained model, docs/BURSTSR_TRAINING.md)')
 parser.add_argument('--skip_algorithm3', action='store_true',
                     help='Run only Part 1 while iterative reference refinement is being debugged')
 
