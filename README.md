@@ -1,7 +1,5 @@
 # Burstormer: Burst Image Restoration and Enhancement Transformer (CVPR 2023)
 
-[Akshay Dudhane](https://scholar.google.com/citations?hl=en), [Syed Waqas Zamir](https://scholar.google.es/citations?user=WNGPkVQAAAAJ&hl=en), [Salman Khan](https://salman-h-khan.github.io/), [Fahad Shahbaz Khan](https://scholar.google.es/citations?user=zvaeYnUAAAAJ&hl=en), and [Ming-Hsuan Yang](https://scholar.google.com/citations?user=p9-ohHsAAAAJ&hl=en)
-
 [![paper](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/pdf/2304.01194.pdf)
 
 
@@ -78,7 +76,7 @@ Code is available [here](https://github.com/akshaydudhane16/BIPNet)
                   }
 
 ## Contact
-Should you have any question, please contact akshay.dudhane@mbzuai.ac.ae
+Should you have any question, please contact lana.zgonjanin@mail.utoronto.ca
 
 
 **Acknowledgment:** This code is based on the [NTIRE21_BURSTSR](https://github.com/goutamgmb/NTIRE21_BURSTSR) toolbox.
