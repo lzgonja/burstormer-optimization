@@ -4,6 +4,8 @@ Script: `Burst Super-resolution/shift_control.py` (v2, branch `shift-control-v2`
 [SHIFT_CONTROL_VALIDATION.md](SHIFT_CONTROL_VALIDATION.md).
 
 Work logs:
+- [All three metrics, 2026-11-24](logs/shift_control_all_metrics_2026-11-24/LOG.md): SSIM and LPIPS added to the
+  control and the benchmark, with the benchmark and the 5 bursts rerun.
 - [v2, 2026-11-22](logs/shift_control_v2_2026-11-22/LOG.md): the refined method, the known-answer benchmark, and
   the runs on 5 bursts and on 40 dev and 40 test bursts, all 14 reference frames.
 - [v1, 2026-11-21](logs/shift_control_2026-11-21/LOG.md): frames 0-4 on 40 dev and 40 test bursts.
@@ -92,19 +94,31 @@ Options of `shift_control.py`:
 - The v1 method is `--geometry translation --region all --estimator forward --fill mirror --colour_ref fixed`.
   It reproduces the v1 numbers to within 0.012 dB.
 
+**All three metrics.** Every image is scored with PSNR, SSIM and LPIPS on the same pixels, and the control reports
+every gain, estimate and penalty for each one. PSNR keeps the original column names. The SSIM and LPIPS versions of
+the derived columns have an `ssim_` or `lpips_` prefix, for example `lpips_gain_corrected`. LPIPS is lower-is-better,
+so its gains are reductions (frame 0 minus frame k). For every metric, a positive gain means frame k is better, and a
+positive penalty means its position costs it score.
+
 Outputs in `--out_dir`:
 - **`per_burst.csv`**: one row per burst and reference frame, plus two probe rows per burst. Columns:
   - `shift_dy`, `shift_dx`: the global shift, in output pixels.
   - `residual_max_px`: the largest part of the geometry beyond that shift.
-  - `psnr_frame0`, `psnr_real`: O_0 and O_k as the standard metric scores them.
-  - `psnr_forward`: O_0 moved to frame k. `psnr_reverse`: O_k moved back to frame 0.
-  - `gain_real` (measured), `gain_forward`, `gain_reverse`, `gain_corrected` (the chosen estimate), `penalty`.
+  - For each metric `m` in `psnr`, `ssim`, `lpips`:
+    - `m_frame0`, `m_real`: O_0 and O_k as the standard metric scores them.
+    - `m_forward`: O_0 moved to frame k. `m_reverse`: O_k moved back to frame 0.
+  - `gain_real` (measured), `gain_forward`, `gain_reverse`, `gain_corrected` (the chosen estimate), `penalty`: PSNR,
+    in dB. The same columns with an `ssim_` or `lpips_` prefix hold SSIM and LPIPS.
   - `fidelity_forward`, `fidelity_reverse`: how closely each moved output matches the one it was moved onto, in
     dB. High values mean the outputs differ mainly by the geometry.
   - `geometry_fallback`: how many of the two geometry fits fell back to the global shift.
   - `common_frac`: the share of pixels scored.
-- **`summary.csv`** and the printed tables: the mean per frame with 95% bootstrap intervals over bursts, the
-  forward-vs-reverse comparison, and the best frame per burst before and after correction.
+- **`summary.csv`** and the printed tables, one set per metric (column `metric`): the mean per frame with 95%
+  bootstrap intervals over bursts, the forward-vs-reverse comparison, and the best frame per burst before and after
+  correction.
+
+`shift_control_benchmark.py` checks the estimators against known answers for all three metrics in the same way. Its
+`per_frame.csv` has `truth`, `roundtrip_loss` and `err_*` columns for PSNR, plus `ssim_` and `lpips_` versions.
 
 **Sanity checks.**
 - **Frame 0:** penalty exactly 0.
@@ -147,6 +161,26 @@ bursts. Full tables: [the log](logs/shift_control_v2_2026-11-22/LOG.md), section
 
 - **The penalty reaches 1.57 dB at frame 13.**
 - **Corrected gains lie between −0.08 and +0.14 dB.** Frames 4 and 7 have intervals just above zero.
+
+## SSIM and LPIPS (2026-11-24)
+
+Details: [the log](logs/shift_control_all_metrics_2026-11-24/LOG.md).
+
+- **The default estimator (reverse, homography) is the most accurate for all three metrics.** On the 9-burst
+  benchmark its RMSE is 0.068 dB PSNR, 0.00022 SSIM and 0.00098 LPIPS. The forward (v1) method is 6, 30 and 16 times
+  less accurate.
+- **SSIM penalises position like PSNR,** up to 0.0047 at frame 13 on the 5 bursts. The benchmark error is about 7%
+  of that.
+- **LPIPS hardly penalises position,** at most about 0.001. Its benchmark error is about 0.0001 without noise and
+  0.002 with noise, so the LPIPS correction is small and, for noise-like changes, within the error.
+- **Test scenes, 40 bursts: all three metrics agree that frames 3-4 beat frame 0.** Corrected gains: PSNR +0.12 dB,
+  SSIM +0.0002, LPIPS +0.0012 to +0.0016, every interval above zero. LPIPS also favours frames 7-13.
+- **Dev scenes, 40 bursts: LPIPS says every frame beats frame 0** (+0.0045 to +0.0074, every interval above zero,
+  positive even before correction). PSNR is inconclusive, as before, and SSIM is flat. A few bursts drive the means
+  for both PSNR and LPIPS.
+- **SSIM's position penalty explains almost all of its measured loss.** Corrected, every frame is within ±0.0002 of
+  frame 0 on both splits.
+- On the 5 bursts alone, corrected SSIM and LPIPS show no frame clearly better than frame 0.
 
 ## Results of v1 (frames 0-4, 2026-11-21)
 

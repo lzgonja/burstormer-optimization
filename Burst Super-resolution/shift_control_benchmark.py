@@ -20,6 +20,10 @@ Estimators: for each geometry model (translation, affine, homography, dense),
     mean     the average of the two.
 All of them, and the known answer, are scored on one region per burst and frame: the pixels every image covers.
 
+Every estimate is checked with all three BurstSR metrics (PSNR, SSIM, LPIPS), signed as in shift_control.py: a
+positive gain is an improvement, so LPIPS gains are reductions. PSNR keeps the original column names (errors in dB);
+the SSIM and LPIPS columns carry an `ssim_` or `lpips_` prefix and are in those metrics' own units.
+
 The warp used to build O_k* has a small loss of its own. It is measured by moving C there and back
 (column roundtrip_loss) and must stay well below the errors being compared.
 
@@ -39,6 +43,7 @@ import torch
 from datasets.burstsr_dataset import BurstSRDataset
 from pwcnet.pwcnet import PWCNet
 from reference_frame_sweep import NUM_FRAMES, FastAlignedMetrics, load_model, reorder, select_bursts, set_seed
+from shift_control import DECIMALS, LABELS, METRICS, SIGN, col
 from shift_geometry import (MODELS, _gauss_blur, consistent_dense, coverage, estimate_geometry, invert,
                             metric_patch_masks, move_reference, warp_image)
 
@@ -93,9 +98,10 @@ def main() -> None:
     frames = list(range(1, args.refs))
 
     est_names = [f'{d}_{m}' for m in models for d in ('fwd', 'rev')]
-    fields = ['burst', 'frame', 'change', 'shift_px', 'true_residual_px', 'flow_replaced_frac', 'truth',
-              'roundtrip_loss'] + \
-        [f'err_{e}' for e in est_names] + [f'fidelity_{m}' for m in models] + ['region_frac']
+    fields = ['burst', 'frame', 'change', 'shift_px', 'true_residual_px', 'flow_replaced_frac']
+    for mt in METRICS:
+        fields += [col(mt, 'truth'), col(mt, 'roundtrip_loss')] + [col(mt, f'err_{e}') for e in est_names]
+    fields += [f'fidelity_{m}' for m in models] + ['region_frac']
     rows: List[Dict] = []
     path = os.path.join(args.out_dir, 'per_frame.csv')
     with open(path, 'w', newline='') as f:
@@ -149,22 +155,27 @@ def main() -> None:
                     region_frac = float(np.mean([r.float().mean().item() for r in region]))
 
                     def s(al):
-                        return metrics.score(al, regions=region)[0]
+                        return dict(zip(METRICS, metrics.score(al, regions=region)))
 
-                    base = s(base_al)
-                    truth = s(truth_al) - base
-                    star_score = s(star_al)
+                    base, truth_s, star_s = s(base_al), s(truth_al), s(star_al)
+                    fwd_s = {m: s(fwd_al[m]) for m in models}
+                    rev_s = {m: s(rev_al[m]) for m in models}
+                    rt_s = s(rt_al) if rt_al is not None else None
                     row = {'burst': name, 'frame': k, 'change': c_name,
                            'shift_px': float(g.displacement(h, w).norm(dim=0).mean()),
                            'true_residual_px': g.max_residual(), 'flow_replaced_frac': g.info['replaced_frac'],
-                           'truth': truth,
-                           'roundtrip_loss': (truth + base - s(rt_al)) if rt_al is not None else '',
                            'region_frac': region_frac}
+                    for mt in METRICS:
+                        sg = SIGN[mt]
+                        truth = sg * (truth_s[mt] - base[mt])
+                        row[col(mt, 'truth')] = truth
+                        row[col(mt, 'roundtrip_loss')] = sg * (truth_s[mt] - rt_s[mt]) if rt_s is not None else ''
+                        for m in models:
+                            fwd = sg * (star_s[mt] - fwd_s[m][mt])  # = real gain + penalty
+                            rev = sg * (rev_s[m][mt] - base[mt])
+                            row[col(mt, f'err_fwd_{m}')] = fwd - truth
+                            row[col(mt, f'err_rev_{m}')] = rev - truth
                     for m in models:
-                        fwd = star_score - s(fwd_al[m])  # = real gain + penalty
-                        rev = s(rev_al[m]) - base
-                        row[f'err_fwd_{m}'] = fwd - truth
-                        row[f'err_rev_{m}'] = rev - truth
                         row[f'fidelity_{m}'] = fidelity[m]
                     rows.append(row)
                     writer.writerow(row)
@@ -176,46 +187,51 @@ def main() -> None:
 
 def summarise(rows: List[Dict], models: List[str], out_dir: str) -> None:
     ests = [f'{d}_{m}' for m in models for d in ('fwd', 'rev', 'mean')]
-
-    def errs(sel, e):
-        d, m = e.split('_', 1)
-        if d == 'mean':
-            return np.array([(r[f'err_fwd_{m}'] + r[f'err_rev_{m}']) / 2 for r in sel])
-        return np.array([r[f'err_{e}'] for r in sel])
-
-    rt = np.array([r['roundtrip_loss'] for r in rows if r['roundtrip_loss'] != ''])
-    print(f'\n{len(rows)} burst-frame-change cases. Warp round-trip loss: mean {rt.mean():+.4f} dB, '
-          f'max |{np.abs(rt).max():.4f}| dB. Error = estimate - known answer, dB.')
-    out = []
-    header = f'{"estimator":>18}{"bias":>9}{"interval":>18}{"RMSE":>8}{"max|err|":>10}' + \
-        ''.join(f'{f"RMSE {lo:.0f}-{hi:.0f}px" if hi < 1e9 else f"RMSE {lo:.0f}+px":>15}' for lo, hi in BUCKETS)
-    print(header)
-    for e in ests:
-        x = errs(rows, e)
-        rec = {'estimator': e, 'bias': x.mean(), 'bias_ci': bootstrap(x), 'rmse': float(np.sqrt((x ** 2).mean())),
-               'max_abs': float(np.abs(x).max())}
-        line = f'{e:>18}{x.mean():>+9.3f}{"[%+.3f, %+.3f]" % tuple(rec["bias_ci"]):>18}{rec["rmse"]:>8.3f}' \
-               f'{rec["max_abs"]:>10.3f}'
-        for lo, hi in BUCKETS:
-            sel = [r for r in rows if lo <= r['shift_px'] < hi]
-            v = float(np.sqrt((errs(sel, e) ** 2).mean())) if sel else float('nan')
-            rec[f'rmse_{lo:.0f}'] = v
-            line += f'{v:>15.3f}'
-        print(line)
-        out.append(rec)
-    print('\nRMSE by content change:')
     changes = sorted({r['change'] for r in rows})
-    print(f'{"estimator":>18}' + ''.join(f'{c:>12}' for c in changes))
-    for e in ests:
-        print(f'{e:>18}' + ''.join(f'{float(np.sqrt((errs([r for r in rows if r["change"] == c], e) ** 2).mean())):>12.3f}'
-                                    for c in changes))
+    rms = lambda x: float(np.sqrt((np.asarray(x) ** 2).mean()))
+    print(f'\n{len(rows)} burst-frame-change cases. Error = estimate - known answer, in each metric\'s units.')
+    out = []
+    for mt in METRICS:
+        d = DECIMALS[mt] + 1
+
+        def errs(sel, e):
+            kind, m = e.split('_', 1)
+            if kind == 'mean':
+                return np.array([(r[col(mt, f'err_fwd_{m}')] + r[col(mt, f'err_rev_{m}')]) / 2 for r in sel])
+            return np.array([r[col(mt, f'err_{e}')] for r in sel])
+
+        rt = np.array([r[col(mt, 'roundtrip_loss')] for r in rows if r[col(mt, 'roundtrip_loss')] != ''])
+        print(f'\n=== {LABELS[mt]} ===')
+        print(f'Warp round-trip loss: mean {rt.mean():+.{d}f}, max |{np.abs(rt).max():.{d}f}|. '
+              f'Size of the known answer (RMS), for scale: ' +
+              ', '.join(f'{c} {rms([r[col(mt, "truth")] for r in rows if r["change"] == c]):.{d}f}' for c in changes))
+        print(f'{"estimator":>18}{"bias":>10}{"interval":>22}{"RMSE":>10}{"max|err|":>10}' +
+              ''.join(f'{f"RMSE {lo:.0f}-{hi:.0f}px" if hi < 1e9 else f"RMSE {lo:.0f}+px":>15}' for lo, hi in BUCKETS))
+        for e in ests:
+            x = errs(rows, e)
+            rec = {'metric': mt, 'estimator': e, 'bias': x.mean(), 'bias_ci': bootstrap(x), 'rmse': rms(x),
+                   'max_abs': float(np.abs(x).max())}
+            line = f'{e:>18}{x.mean():>+10.{d}f}{"[%+.*f, %+.*f]" % (d, rec["bias_ci"][0], d, rec["bias_ci"][1]):>22}' \
+                   f'{rec["rmse"]:>10.{d}f}{rec["max_abs"]:>10.{d}f}'
+            for lo, hi in BUCKETS:
+                sel = [r for r in rows if lo <= r['shift_px'] < hi]
+                v = rms(errs(sel, e)) if sel else float('nan')
+                rec[f'rmse_{lo:.0f}'] = v
+                line += f'{v:>15.{d}f}'
+            print(line)
+            out.append(rec)
+        print(f'\nRMSE by content change, {LABELS[mt]}:')
+        print(f'{"estimator":>18}' + ''.join(f'{c:>12}' for c in changes))
+        for e in ests:
+            print(f'{e:>18}' + ''.join(f'{rms(errs([r for r in rows if r["change"] == c], e)):>12.{d}f}'
+                                        for c in changes))
     print('\nGeometric fidelity (moved O_0 vs O_k*, dB, mean):  ' +
           '  '.join(f'{m} {np.mean([r[f"fidelity_{m}"] for r in rows]):.1f}' for m in models))
     with open(os.path.join(out_dir, 'summary.csv'), 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(out[0].keys()))
         writer.writeheader()
         for rec in out:
-            writer.writerow({k: (' '.join(f'{x:.4f}' for x in v) if isinstance(v, list) else v) for k, v in rec.items()})
+            writer.writerow({k: (' '.join(f'{x:.5f}' for x in v) if isinstance(v, list) else v) for k, v in rec.items()})
 
 
 if __name__ == '__main__':

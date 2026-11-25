@@ -207,7 +207,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--weights",
-        default="./Trained_models/Real/burstormer_real_calibrated.pth",
+        default="./Trained_models/Real/burstormer_burstsr_train.pth",
         type=str,
     )
     parser.add_argument("--data_root", default="./burstsr_dataset", type=str)

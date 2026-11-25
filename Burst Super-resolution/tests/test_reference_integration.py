@@ -53,7 +53,43 @@ def test_duplicate_selections_reuse_reconstruction():
 
 def test_frame0_corrected_gain_is_zero():
     shift_control = pytest.importorskip('shift_control')
-    assert shift_control.evaluate_reference_pair({}, 0, None, None, None, None) == 0.0
+    assert shift_control.evaluate_reference_pair({}, 0, None, None, None, None) == {
+        'psnr_gain_vs_frame0': 0.0, 'ssim_gain_vs_frame0': 0.0, 'lpips_improvement_vs_frame0': 0.0}
+
+
+def test_corrected_gains_cover_all_metrics_on_one_region(monkeypatch):
+    # O_k moved back to frame 0 is scored against O_0 on the same region, for PSNR, SSIM and LPIPS
+    torch = pytest.importorskip('torch')
+    shift_control = pytest.importorskip('shift_control')
+    from shift_geometry import Geometry
+
+    o0, ok = torch.zeros(1, 3, 16, 16), torch.ones(1, 3, 16, 16)
+    moved_back = torch.full((1, 3, 16, 16), 0.5)
+    monkeypatch.setattr(shift_control, 'estimate_geometry', lambda a, b, model, net: Geometry(torch.zeros(2)))
+    monkeypatch.setattr(shift_control, 'warp_image',
+                        lambda img, geo, factor, fill=None: moved_back if img is ok else img)
+    monkeypatch.setattr(shift_control, 'move_reference', lambda burst, frame, geo, at: burst)
+    monkeypatch.setattr(shift_control, 'coverage', lambda geo, h, w, device: torch.ones(h, w, dtype=torch.bool))
+    monkeypatch.setattr(shift_control, 'metric_patch_masks', lambda mask: [torch.tensor([True, True])])
+    score_regions = []
+
+    class Metrics:
+        def align_patches(self, output, gt, burst):
+            values = (30.0, 0.80, 0.25) if output is o0 else (32.5, 0.85, 0.15) if output is moved_back else \
+                (0.0, 0.0, 1.0)
+            return [{'valid': torch.tensor([True, True]), 'in_view': torch.tensor([True, output is not ok]),
+                     'values': values}]
+
+        def score(self, aligned, regions):
+            score_regions.append(regions[0].tolist())
+            return aligned[0]['values']
+
+    gains = shift_control.evaluate_reference_pair({0: o0, 3: ok}, 3, torch.zeros(1, 14, 4, 8, 8), object(),
+                                                  Metrics(), None)
+    assert gains == pytest.approx({'psnr_gain_vs_frame0': 2.5, 'ssim_gain_vs_frame0': 0.05,
+                                   'lpips_improvement_vs_frame0': 0.10})
+    # Only the reverse estimate is scored, on the pixels every image of the comparison covers
+    assert score_regions == [[True, False], [True, False]]
 
 
 def test_algorithm3_uses_cached_frame0_and_one_additional_inference():
@@ -125,8 +161,8 @@ def test_experiment_csv_schema_and_metadata(tmp_path):
          else 'adaptive_reference_selection',
          'selected_reference_index': '' if method == 'algorithm3' else 0,
          'psnr_gain_vs_frame0': 0.5 if method == 'algorithm3' else 0.0,
-         'ssim_gain_vs_frame0': 0.05 if method == 'algorithm3' else '',
-         'lpips_improvement_vs_frame0': 0.1 if method == 'algorithm3' else '',
+         'ssim_gain_vs_frame0': 0.05 if method == 'algorithm3' else 0.0,
+         'lpips_improvement_vs_frame0': 0.1 if method == 'algorithm3' else 0.0,
          'alpha': 0.25 if method == 'algorithm3' else '',
          'evaluation_method': 'same_reference_pair' if method == 'algorithm3'
          else 'v2_reverse_shift_control'}
@@ -146,6 +182,7 @@ def test_experiment_csv_schema_and_metadata(tmp_path):
                          'selected_reference_index': '', 'psnr_gain_vs_frame0': '0.5',
                          'ssim_gain_vs_frame0': '0.05', 'lpips_improvement_vs_frame0': '0.1',
                          'alpha': '0.25', 'evaluation_method': 'same_reference_pair'}
-    assert all(row['ssim_gain_vs_frame0'] == '' and row['lpips_improvement_vs_frame0'] == ''
+    # The adaptive methods carry shift-corrected gains for all three metrics too
+    assert all(row['ssim_gain_vs_frame0'] == '0.0' and row['lpips_improvement_vs_frame0'] == '0.0'
                for row in saved[:-1])
     assert reconstruction_filename('burst_001', 'algorithm3') == 'burst_001_algorithm3.png'
