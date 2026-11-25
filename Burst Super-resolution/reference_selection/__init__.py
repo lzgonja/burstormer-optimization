@@ -14,6 +14,8 @@ EXPERIMENT_FIELDS = (
     "experiment_type",
     "selected_reference_index",
     "psnr_gain_vs_frame0",
+    "ssim_gain_vs_frame0",
+    "lpips_improvement_vs_frame0",
     "alpha",
     "evaluation_method",
 )

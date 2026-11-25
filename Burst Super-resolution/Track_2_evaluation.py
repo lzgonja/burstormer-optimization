@@ -114,7 +114,8 @@ class BurstSR_Test_Network():
                 experiment_rows.append({'burst_id': burst_name[0], 'selection_method': method,
                                         'experiment_type': 'adaptive_reference_selection',
                                         'selected_reference_index': selected_ref,
-                                        'psnr_gain_vs_frame0': corrected_gain, 'alpha': '',
+                                        'psnr_gain_vs_frame0': corrected_gain,
+                                        'ssim_gain_vs_frame0': '', 'lpips_improvement_vs_frame0': '', 'alpha': '',
                                         'evaluation_method': 'v2_reverse_shift_control'})
                 net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
                 cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], method)), net_pred_np)
@@ -132,18 +133,20 @@ class BurstSR_Test_Network():
                     with torch.no_grad():
                         algorithm3_burst = build_synthetic_reference_burst(burst, outputs[0], FINAL_ALPHA)
                         algorithm3_output = model(algorithm3_burst).clamp(0.0, 1.0)
-                        algorithm3_gain = evaluate_same_reference_pair(
+                        algorithm3_gains = evaluate_same_reference_pair(
                             outputs[0], algorithm3_output, burst, labels, self.shift_metrics)
                     experiment_rows.append({'burst_id': burst_name[0], 'selection_method': 'algorithm3',
                                             'experiment_type': 'iterative_reference_refinement',
                                             'selected_reference_index': '',
-                                            'psnr_gain_vs_frame0': algorithm3_gain, 'alpha': FINAL_ALPHA,
+                                            **algorithm3_gains, 'alpha': FINAL_ALPHA,
                                             'evaluation_method': 'same_reference_pair'})
                     net_pred_np = (algorithm3_output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
                     cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], 'algorithm3')),
                                 net_pred_np)
                     print(f'Burst {i}, algorithm3, synthetic reference alpha {FINAL_ALPHA}: '
-                          f'PSNR gain {algorithm3_gain:+.3f} dB')
+                          f'PSNR gain {algorithm3_gains["psnr_gain_vs_frame0"]:+.3f} dB, '
+                          f'SSIM gain {algorithm3_gains["ssim_gain_vs_frame0"]:+.5f}, '
+                          f'LPIPS improvement {algorithm3_gains["lpips_improvement_vs_frame0"]:+.5f}')
                     write_experiment_csv(csv_path, experiment_rows)
                 except Exception as error:
                     print(f'Burst {i}, algorithm3 failed; Part 1 results were preserved: {error}')

@@ -76,23 +76,33 @@ def test_algorithm3_uses_cached_frame0_and_one_additional_inference():
     assert torch.equal(modified[:, 1:], original[:, 1:])
 
 
-def test_same_reference_pair_gain_uses_one_shared_region():
+def test_same_reference_pair_metric_gains_use_same_ground_truth_and_region():
     torch = pytest.importorskip('torch')
     shift_control = pytest.importorskip('shift_control')
-    baseline, candidate = object(), object()
+    baseline, candidate, ground_truth, burst_input = object(), object(), object(), object()
+    alignment_calls, score_regions = [], []
 
     class Metrics:
         def align_patches(self, output, gt, burst):
-            value = 30.0 if output is baseline else 32.5
+            assert gt is ground_truth
+            assert burst is burst_input
+            alignment_calls.append(output)
+            values = (30.0, 0.80, 0.25) if output is baseline else (32.5, 0.85, 0.15)
             return [{'valid': torch.tensor([True, True]),
-                     'in_view': torch.tensor([True, False]), 'psnr': value}]
+                     'in_view': torch.tensor([True, False]), 'values': values}]
 
         def score(self, aligned, regions):
             assert regions[0].tolist() == [True, False]
-            return aligned[0]['psnr'], 0.0, 0.0
+            score_regions.append(regions)
+            return aligned[0]['values']
 
-    gain = shift_control.evaluate_same_reference_pair(baseline, candidate, None, None, Metrics())
-    assert gain == pytest.approx(2.5)
+    gains = shift_control.evaluate_same_reference_pair(
+        baseline, candidate, burst_input, ground_truth, Metrics())
+    assert alignment_calls == [baseline, candidate]
+    assert score_regions[0] is score_regions[1]
+    assert gains == pytest.approx({'psnr_gain_vs_frame0': 2.5,
+                                   'ssim_gain_vs_frame0': 0.05,
+                                   'lpips_improvement_vs_frame0': 0.10})
 
 
 def test_selected_frame_moves_first_and_preserves_capture_order():
@@ -115,6 +125,8 @@ def test_experiment_csv_schema_and_metadata(tmp_path):
          else 'adaptive_reference_selection',
          'selected_reference_index': '' if method == 'algorithm3' else 0,
          'psnr_gain_vs_frame0': 0.5 if method == 'algorithm3' else 0.0,
+         'ssim_gain_vs_frame0': 0.05 if method == 'algorithm3' else '',
+         'lpips_improvement_vs_frame0': 0.1 if method == 'algorithm3' else '',
          'alpha': 0.25 if method == 'algorithm3' else '',
          'evaluation_method': 'same_reference_pair' if method == 'algorithm3'
          else 'v2_reverse_shift_control'}
@@ -124,12 +136,16 @@ def test_experiment_csv_schema_and_metadata(tmp_path):
     with path.open(newline='') as handle:
         reader = csv.DictReader(handle)
         assert reader.fieldnames == ['burst_id', 'selection_method', 'experiment_type', 'selected_reference_index',
-                                     'psnr_gain_vs_frame0', 'alpha', 'evaluation_method']
+                                     'psnr_gain_vs_frame0', 'ssim_gain_vs_frame0',
+                                     'lpips_improvement_vs_frame0', 'alpha', 'evaluation_method']
         saved = list(reader)
     assert [row['selection_method'] for row in saved] == list(EVALUATION_METHODS)
     assert {row['experiment_type'] for row in saved[:-1]} == {'adaptive_reference_selection'}
     assert saved[-1] == {'burst_id': 'burst_001', 'selection_method': 'algorithm3',
                          'experiment_type': 'iterative_reference_refinement',
                          'selected_reference_index': '', 'psnr_gain_vs_frame0': '0.5',
+                         'ssim_gain_vs_frame0': '0.05', 'lpips_improvement_vs_frame0': '0.1',
                          'alpha': '0.25', 'evaluation_method': 'same_reference_pair'}
+    assert all(row['ssim_gain_vs_frame0'] == '' and row['lpips_improvement_vs_frame0'] == ''
+               for row in saved[:-1])
     assert reconstruction_filename('burst_001', 'algorithm3') == 'burst_001_algorithm3.png'

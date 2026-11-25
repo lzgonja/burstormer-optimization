@@ -99,14 +99,18 @@ def evaluate_reference_pair(outputs, reference, burst, gt, metrics, flow_net, ge
 
 
 def evaluate_same_reference_pair(baseline, candidate, burst, gt, metrics):
-    """PSNR gain for two frame-0-view outputs scored on their shared valid region."""
+    """Metric gains for two frame-0-view outputs scored on their shared valid region."""
     base_al = metrics.align_patches(baseline, gt, burst)
     candidate_al = metrics.align_patches(candidate, gt, burst)
     regions = [base['valid'] & base['in_view'] & selected['valid'] & selected['in_view']
                for base, selected in zip(base_al, candidate_al)]
-    psnr_frame0 = metrics.score(base_al, regions=regions)[0]
-    psnr_candidate = metrics.score(candidate_al, regions=regions)[0]
-    return psnr_candidate - psnr_frame0
+    psnr_frame0, ssim_frame0, lpips_frame0 = metrics.score(base_al, regions=regions)
+    psnr_candidate, ssim_candidate, lpips_candidate = metrics.score(candidate_al, regions=regions)
+    return {
+        'psnr_gain_vs_frame0': psnr_candidate - psnr_frame0,
+        'ssim_gain_vs_frame0': ssim_candidate - ssim_frame0,
+        'lpips_improvement_vs_frame0': lpips_frame0 - lpips_candidate,
+    }
 
 
 def bootstrap(x: np.ndarray, n: int = 10000, seed: int = 0) -> List[float]:
