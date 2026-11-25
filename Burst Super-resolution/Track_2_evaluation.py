@@ -110,17 +110,18 @@ class BurstSR_Test_Network():
                 if selected_ref not in gain_by_ref:
                     gain_by_ref[selected_ref] = evaluate_reference_pair(
                         outputs, selected_ref, burst, labels, self.shift_metrics, self.alignment_net)
-                corrected_gain = gain_by_ref[selected_ref]
+                corrected_gains = gain_by_ref[selected_ref]
                 experiment_rows.append({'burst_id': burst_name[0], 'selection_method': method,
                                         'experiment_type': 'adaptive_reference_selection',
                                         'selected_reference_index': selected_ref,
-                                        'psnr_gain_vs_frame0': corrected_gain,
-                                        'ssim_gain_vs_frame0': '', 'lpips_improvement_vs_frame0': '', 'alpha': '',
+                                        **corrected_gains, 'alpha': '',
                                         'evaluation_method': 'v2_reverse_shift_control'})
                 net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
                 cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], method)), net_pred_np)
                 print(f'Burst {i}, {method}, reference {selected_ref}: '
-                      f'v2 corrected PSNR gain {corrected_gain:+.3f} dB')
+                      f'v2 corrected PSNR gain {corrected_gains["psnr_gain_vs_frame0"]:+.3f} dB, '
+                      f'SSIM gain {corrected_gains["ssim_gain_vs_frame0"]:+.5f}, '
+                      f'LPIPS improvement {corrected_gains["lpips_improvement_vs_frame0"]:+.5f}')
 
             # Persist Part 1 before the optional/experimental Part 2 path.
             write_experiment_csv(csv_path, experiment_rows)

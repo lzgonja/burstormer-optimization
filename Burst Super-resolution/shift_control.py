@@ -75,13 +75,15 @@ def col(metric: str, name: str) -> str:
 
 def evaluate_reference_pair(outputs, reference, burst, gt, metrics, flow_net, geometry='homography', factor=8,
                             colour_ref='moved', fill='target'):
-    """Return v2 reverse-corrected PSNR gain over frame 0 on one pair-valid region.
+    """Return the v2 reverse-corrected gains over frame 0 for all three metrics, on one pair-valid region.
 
     This is the default reverse-correction path from :func:`main`, exposed so an
     experiment can reuse its reconstructions instead of running a separate sweep.
+    The keys match :func:`evaluate_same_reference_pair`; a positive value always means
+    the selected reference is better (for LPIPS, a reduction).
     """
     if reference == 0:
-        return 0.0
+        return {'psnr_gain_vs_frame0': 0.0, 'ssim_gain_vs_frame0': 0.0, 'lpips_improvement_vs_frame0': 0.0}
 
     o0 = outputs[0]
     base_al = metrics.align_patches(o0, gt, burst)
@@ -111,9 +113,13 @@ def evaluate_reference_pair(outputs, reference, burst, gt, metrics, flow_net, ge
         [al[p]['valid'] & al[p]['in_view'] for al in (base_al, real_al, fwd_al, rev_al)] +
         [mask[p].to(base_al[p]['valid'].device) for mask in masks]
     ).all(dim=0) for p in range(len(base_al))]
-    psnr_frame0 = metrics.score(base_al, regions=regions)[0]
-    psnr_reverse = metrics.score(rev_al, regions=regions)[0]
-    return psnr_reverse - psnr_frame0
+    psnr_frame0, ssim_frame0, lpips_frame0 = metrics.score(base_al, regions=regions)
+    psnr_reverse, ssim_reverse, lpips_reverse = metrics.score(rev_al, regions=regions)
+    return {
+        'psnr_gain_vs_frame0': psnr_reverse - psnr_frame0,
+        'ssim_gain_vs_frame0': ssim_reverse - ssim_frame0,
+        'lpips_improvement_vs_frame0': lpips_frame0 - lpips_reverse,
+    }
 
 
 def evaluate_same_reference_pair(baseline, candidate, burst, gt, metrics):

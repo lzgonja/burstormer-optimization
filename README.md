@@ -27,13 +27,13 @@ This project extends Burstormer to investigate whether changing its reference-fr
 
 We evaluate two algorithms that select a reference from the original 14-frame burst: Gradient-Based Reference Selection (GBRS) and Exposure-Aware Consistency. Each selected reference is moved to the first position before being passed into Burstormer, without modifying the model architecture.
 
-Reconstruction quality is evaluated using a shift-control method that accounts for positional bias between different reference frames. Performance is measured as the corrected PSNR gain relative to the fixed frame-0 baseline.
+Reconstruction quality is evaluated using a shift-control method that accounts for positional bias between different reference frames. Performance is measured as the corrected PSNR, SSIM and LPIPS gains relative to the fixed frame-0 baseline (for LPIPS, the reduction).
 
 **Part 2 — Iterative Reference-Frame Refinement**
 
 Algorithm 3 takes Burstormer's initial reconstruction, converts it into an approximate RAW reference, and blends it with the original frame 0 (α = 0.25). The modified burst is then passed through Burstormer a second time, keeping the other 13 frames unchanged.
 
-Performance is measured using the PSNR gain relative to the frame-0 baseline over a shared valid image region.
+Performance is measured using the PSNR, SSIM and LPIPS gains relative to the frame-0 baseline over a shared valid image region.
 
 ### Running the Evaluation
 
@@ -42,7 +42,7 @@ Both approaches are integrated into `Burst Super-resolution/Track_2_evaluation.p
 Outputs are saved under `Results/Real/Testing Phase/`:
 
 - **Reconstructed images:** Individual 16-bit PNGs for each burst and method (frame 0, GBRS, Algorithm 2, and Algorithm 3).
-- **`per_burst.csv`:** Reference indices (where applicable), PSNR gains relative to frame 0, blending factors, and evaluation methods.
+- **`per_burst.csv`:** Reference indices (where applicable), PSNR and SSIM gains and LPIPS improvements relative to frame 0, blending factors, and evaluation methods.
 
 ## Network Architecture
 
