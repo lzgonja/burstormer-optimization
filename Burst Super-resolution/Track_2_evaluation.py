@@ -31,6 +31,9 @@ from reference_selection import (reconstruct_selected_references, reconstruction
                                  select_available_references, write_experiment_csv)
 from shift_control import evaluate_reference_pair, evaluate_same_reference_pair
 
+from Track_2_visualization import save_comparison
+from utils.metrics import AlignedPred
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -117,8 +120,8 @@ class BurstSR_Test_Network():
                                         'selected_reference_index': selected_ref,
                                         **corrected_gains, 'alpha': '',
                                         'evaluation_method': 'v2_reverse_shift_control'})
-                net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
-                cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], method)), net_pred_np)
+                # net_pred_np = (output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
+                # cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], method)), net_pred_np)
                 print(f'Burst {i}, {method}, reference {selected_ref}: '
                       f'v2 corrected PSNR gain {corrected_gains["psnr_gain_vs_frame0"]:+.3f} dB, '
                       f'SSIM gain {corrected_gains["ssim_gain_vs_frame0"]:+.5f}, '
@@ -135,6 +138,8 @@ class BurstSR_Test_Network():
                     with torch.no_grad():
                         algorithm3_burst = build_synthetic_reference_burst(burst, outputs[0], FINAL_ALPHA)
                         algorithm3_output = model(algorithm3_burst).clamp(0.0, 1.0)
+                        # Add Algorithm 3 to the existing outputs dictionary
+                        outputs["algorithm3"] = algorithm3_output
                         algorithm3_gains = evaluate_same_reference_pair(
                             outputs[0], algorithm3_output, burst, labels, self.shift_metrics)
                     experiment_rows.append({'burst_id': burst_name[0], 'selection_method': 'algorithm3',
@@ -142,9 +147,9 @@ class BurstSR_Test_Network():
                                             'selected_reference_index': '',
                                             **algorithm3_gains, 'alpha': FINAL_ALPHA,
                                             'evaluation_method': 'same_reference_pair'})
-                    net_pred_np = (algorithm3_output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
-                    cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], 'algorithm3')),
-                                net_pred_np)
+                    # net_pred_np = (algorithm3_output[0].permute(1, 2, 0) * 2 ** 14).cpu().numpy().astype(np.uint16)
+                    # cv2.imwrite(os.path.join(result_dir, reconstruction_filename(burst_name[0], 'algorithm3')),
+                    #             net_pred_np)
                     print(f'Burst {i}, algorithm3, synthetic reference alpha {FINAL_ALPHA}: '
                           f'PSNR gain {algorithm3_gains["psnr_gain_vs_frame0"]:+.3f} dB, '
                           f'SSIM gain {algorithm3_gains["ssim_gain_vs_frame0"]:+.5f}, '
@@ -172,6 +177,27 @@ class BurstSR_Test_Network():
             
             cv2.imwrite('{}/{}'.format(result_dir, burst_name[0] +'.png'), output)
             """
+            outputs['gt'] = labels
+
+            # Convert ground-truth metadata into the format expected by
+            # process_burstsr_image_rgb.
+            meta_info_gt = convert_dict(meta_info_gt, labels.shape[0])
+
+            # Save individual images and generate the comparison.
+            visualization_dir = os.path.join(result_dir, "Visualizations")
+
+            save_comparison(
+                outputs=outputs,
+                selections=selections,
+                burst_name=burst_name[0],
+                meta_info_gt=meta_info_gt[0],
+                alignment_net=self.alignment_net,
+                burst=burst,
+                output_dir=visualization_dir
+            )
+
+
+
         
         write_experiment_csv(csv_path, experiment_rows)
 
