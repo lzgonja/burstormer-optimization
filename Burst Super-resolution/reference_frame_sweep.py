@@ -271,8 +271,8 @@ def reorder(burst: torch.Tensor, ref: int) -> torch.Tensor:
 def select_reference(burst: torch.Tensor, policy: str, margin: float = None) -> int:
     """Index of the frame to use as reference, from the input burst alone. burst: [1, N, 4, H, W].
     Policies: frame0 (original behaviour), frame2 (best fixed frame on dev), guarded (see ref_selection.py),
-    algorithm2 (exposure-aware consistency, see reference_selection/algorithm2.py).
-    `margin` overrides the policy's own default margin."""
+    algorithm2 (central, exposure-consistent frame, see reference_selection/algorithm2.py).
+    `margin` overrides the policy's own default margin (for algorithm2, its health gate)."""
     if policy == 'frame0':
         return 0
     if policy == 'frame2':
@@ -281,7 +281,7 @@ def select_reference(burst: torch.Tensor, policy: str, margin: float = None) -> 
         sharp = frame_sharpness_smoothed(burst).tolist()
         return guarded_choice(dict(enumerate(sharp)), margin=GUARD_MARGIN if margin is None else margin)
     if policy == 'algorithm2':
-        return algorithm2.select_reference_frame(burst, margin=algorithm2.MARGIN if margin is None else margin)
+        return algorithm2.select_reference_frame(burst, margin=algorithm2.HEALTH_MARGIN if margin is None else margin)
     raise ValueError(f'Unknown reference policy {policy}')
 
 

@@ -23,7 +23,7 @@ This project extends Burstormer to investigate whether changing its reference-fr
 
 **Part 1 — Adaptive Reference-Frame Selection**
 
-We evaluate two algorithms that select a reference from the original 14-frame burst: Gradient-Based Reference Selection (GBRS) and Exposure-Aware Consistency. Each selected reference is moved to the first position before being passed into Burstormer, without modifying the model architecture.
+We evaluate two algorithms that select a reference from the original 14-frame burst: Gradient-Based Reference Selection (GBRS) and Central, Exposure-Consistent Selection (the healthy frame closest to the burst's motion centre whose brightness matches the burst). Each selected reference is moved to the first position before being passed into Burstormer, without modifying the model architecture.
 
 Reconstruction quality is evaluated using a shift-control method that accounts for positional bias between different reference frames. Performance is measured as the corrected PSNR, SSIM and LPIPS gains relative to the fixed frame-0 baseline (for LPIPS, the reduction).
 

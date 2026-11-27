@@ -1,8 +1,128 @@
-# Algorithm 2: exposure-aware consistency selection, results
+# Algorithm 2: results
 
-Run of 2026-11-21. Method and parameters: [ALGORITHMS.md](../ALGORITHMS.md#algorithm-2-exposure-aware-consistency-selection).
-Code: `Burst Super-resolution/reference_selection/algorithm2.py`. Raw summaries:
-[logs/algorithm2_2026-11-21/](logs/algorithm2_2026-11-21/).
+Method and parameters: [ALGORITHMS.md](../ALGORITHMS.md#algorithm-2-central-exposure-consistent-reference-selection).
+Code: `Burst Super-resolution/reference_selection/algorithm2.py`.
+
+## Current version: central, exposure-consistent selection (2026-11-27)
+
+Raw outputs: [logs/algorithm2_central_2026-11-27/](logs/algorithm2_central_2026-11-27/). Model:
+`burstormer_burstsr_train.pth`. Labels: the shift-control runs of 2026-11-24
+([logs/shift_control_all_metrics_2026-11-24/](logs/shift_control_all_metrics_2026-11-24/)). They give, for each of
+40 dev and 40 test bursts, the shift-corrected PSNR, SSIM and LPIPS gain of every one of the 14 frames as reference
+over frame 0. A selector's gain on a burst is the labelled gain of the frame it picks, so every selector is scored
+on the same numbers without running the network (`score_ref_selectors.py`).
+
+### Summary
+
+- **Algorithm 2 now beats frame 0 on all three metrics on the test scenes,** with every interval above zero:
+  +0.127 dB PSNR, +0.217e-3 SSIM and +1.369e-3 LPIPS. That is 37-46% of what a perfect per-burst choice would gain.
+  The first version gained +0.011 dB, because it kept frame 0 in 95% of bursts.
+- **The end-to-end pipeline agrees.** `Track_2_evaluation.py` on the same 40 test bursts gives exactly the same
+  three numbers ([track2_test_40_per_burst.csv](logs/algorithm2_central_2026-11-27/track2_test_40_per_burst.csv)).
+- **It is ahead of GBRS on all three metrics on test** (GBRS: +0.059 dB, +0.019e-3, +0.928e-3), though the paired
+  difference is not significant on any single metric.
+- **On dev it is positive but less certain:** +0.197 dB PSNR, +0.079e-3 SSIM, +6.80e-3 LPIPS. Only the LPIPS
+  interval excludes zero.
+- **On clean bursts it is tied with a fixed middle frame.** Most of the gain comes from moving the reference from
+  the edge of the burst to the middle. No burst-only feature tested ranks frames within a burst well (next
+  section).
+- **It still avoids damaged frames.** When the frame it would pick is damaged, it takes a neighbouring healthy frame
+  (1.4 frames away on average).
+
+### Clean bursts
+
+Gain over frame 0, 95% bootstrap over bursts. SSIM and LPIPS are in units of 1e-3. A positive LPIPS gain means a
+lower (better) LPIPS.
+
+| Selector | Test PSNR (dB) | Test SSIM | Test LPIPS | Dev PSNR (dB) | Dev SSIM | Dev LPIPS |
+|---|---|---|---|---|---|---|
+| Frame 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Algorithm 1 (GBRS) | +0.059 [+0.005, +0.118] | +0.019 [-0.091, +0.149] | +0.928 [+0.278, +1.652] | +0.172 [-0.071, +0.454] | -0.088 [-0.794, +0.635] | +5.911 [+2.796, +9.644] |
+| Algorithm 2, first version | +0.011 [+0.000, +0.031] | +0.039 [+0.000, +0.116] | +0.280 [+0.000, +0.813] | -0.001 [-0.005, +0.002] | +0.006 [+0.000, +0.015] | +0.024 [-0.002, +0.071] |
+| **Algorithm 2** | **+0.127 [+0.056, +0.204]** | **+0.217 [+0.020, +0.425]** | **+1.369 [+0.525, +2.269]** | **+0.197 [-0.078, +0.492]** | **+0.079 [-0.561, +0.762]** | **+6.799 [+3.440, +10.767]** |
+| Fixed frame 3 | +0.116 | +0.218 | +1.182 | +0.211 | +0.031 | +6.031 |
+| Fixed frame 5 | +0.116 | +0.101 | +0.592 | +0.204 | +0.036 | +7.401 |
+| Oracle (uses ground truth) | +0.276 | +0.585 | +3.145 | +0.609 | +1.095 | +8.655 |
+
+Frames picked: frames 5-8 in 77 of 80 bursts (test: 6 and 7 in 32 of 40; dev: 7 in 22 of 40).
+
+### What predicts the best frame
+
+Per-frame features from the burst alone, inspired by the papers behind algorithms 1 and 2. Mean within-burst rank
+correlation with the corrected gain, over 40 bursts
+([feature_analysis.txt](logs/algorithm2_central_2026-11-27/feature_analysis.txt)):
+
+| Feature | Source | Dev PSNR | Dev SSIM | Dev LPIPS | Test PSNR | Test SSIM | Test LPIPS |
+|---|---|---|---|---|---|---|---|
+| Mean motion to the other frames | centrality | +0.00 | -0.05 | -0.21 | -0.18 | -0.11 | -0.02 |
+| Gradient magnitude | HDR+ sharpness | -0.01 | -0.06 | -0.00 | -0.13 | -0.06 | +0.17 |
+| Q score | Zhu & Milanfar (algorithm 1) | -0.09 | -0.08 | +0.17 | -0.01 | +0.01 | +0.03 |
+| Consistency with all frames | algorithm 2, first version | +0.05 | +0.04 | -0.16 | -0.02 | -0.05 | +0.07 |
+| Brightness deviation | Buades et al. | -0.15 | -0.17 | -0.23 | -0.16 | -0.08 | -0.01 |
+| Noise estimate | | +0.05 | +0.00 | +0.04 | -0.04 | +0.01 | +0.13 |
+
+None is above 0.25 in size, and most change sign between metrics or splits. Image quality as these scores measure
+it does not tell which frame Burstormer reconstructs best. Brightness deviation is the most consistent (negative in
+all six columns), which is why it is in the rule.
+
+Averaged over bursts, the picture is clearer ([features_by_frame.txt](logs/algorithm2_central_2026-11-27/features_by_frame.txt)):
+- **Frame 0 is at the edge of the burst.** On dev it is on average 5.4 px from the other frames, against
+  2.6-2.8 px for frames 5-8 (test: 3.7 against 2.0-2.2).
+- **Its brightness differs most from the burst median.** The deviation is 2.5-2.7%, against 1% or less for frames 6-8.
+- **Every other frame beats it on average.** On test, frames 3-9 gain +0.08 to +0.12 dB.
+
+### How the rule was chosen
+
+On dev only. Candidates: fixed frames, the most central frame within a window of frames, and
+`z(centrality) + w * z(brightness) + m * z(consistency)` for w = 0-2 and m = 0-0.5. The rules were ranked by the
+fraction of the oracle captured, averaged over the three metrics.
+- **The top dev rule, "always frame 2", does not hold up:** 43% of the oracle on dev but 11% on test. The leading
+  rules are all within noise of each other on dev, so fixed frames were set aside. They also cannot avoid a damaged
+  frame.
+- **Among the adaptive rules, centrality plus brightness with w = 0.25 or 0.5 was best on dev** (39% of the
+  oracle). Adding the consistency term did not help.
+- **A synthetic test showed that standardising the brightness can amplify sub-percent noise.** The brightness
+  spread is therefore floored at 1%. Floors from 0.5% to 2% are tied on dev.
+- **The health gate (30%) changes no pick on the clean bursts.**
+
+### Damaged frames
+
+No network: on each of the 80 bursts, the frame the rule picks on the clean burst is damaged with
+`robustness_sweep.degrade`, and the rule is run again
+([damage_selection.txt](logs/algorithm2_central_2026-11-27/damage_selection.txt)).
+
+| Damage | Damaged frame avoided | Damage | Damaged frame avoided |
+|---|---|---|---|
+| Blur 0.5 | 3/80 | Noise 0.001 | 55/80 |
+| Blur 1 | 71/80 | Noise 0.003 | 78/80 |
+| Blur 2 | 79/80 | Noise 0.01, 0.03 | 80/80 |
+| Under x0.5, x0.25, x0.125 | 80/80 | Over x2, x4, x8 | 80/80 |
+
+When it avoids the damaged frame, it moves 1.4 frames on average, to a neighbour that is about as central. Blur 0.5
+costs frame 0 only 0.3 dB (first-version table below), and the first version did not avoid it either.
+
+### Limits
+
+- **The labels are estimates.** The shift control's reverse estimate has an RMSE of 0.03-0.13 dB
+  (`docs/SHIFT_CONTROL.md`), about the size of the differences between neighbouring frames. Part of the oracle's
+  headroom is selection noise.
+- **40 bursts per split.** On dev only LPIPS is significant.
+- **The damage test checks the selection only, not the reconstruction.** The neighbour it moves to is about as good
+  on clean bursts, so the reconstruction should be too, but this was not run through the network.
+
+### Commands
+
+From `Burst Super-resolution/`:
+
+```
+python -m pytest tests/test_algorithm2.py
+python score_ref_selectors.py --labels ../docs/logs/shift_control_all_metrics_2026-11-24/test_40_bursts/per_burst.csv
+python score_ref_selectors.py --labels ../docs/logs/shift_control_all_metrics_2026-11-24/dev_40_bursts/per_burst.csv
+```
+
+## First version: exposure-aware consistency selection (2026-11-21)
+
+Raw summaries: [logs/algorithm2_2026-11-21/](logs/algorithm2_2026-11-21/). Now `select_reference_frame_v1`.
 
 Model: `burstormer_burstsr_train.pth` (T02, step 10,000). Metric: aligned PSNR on BurstSR val crops. The selector
 takes about 18 ms per burst on the CPU.
