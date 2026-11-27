@@ -66,6 +66,100 @@ def expose(frame: torch.Tensor, k: float, gen: torch.Generator) -> torch.Tensor:
     return (out.clamp(0.0, 1.0) * 1023).round() / 1023
 
 
+def make_drifting_burst(n: int = 14, size: int = 64, step: int = 1, seed: int = 0, mean_level: float = 0.08):
+    """Burst [n, 4, size, size] whose camera drifts by `step` px per frame (diagonally), plus shot noise. The frames
+    in the middle of the burst are the closest to all the others. Returns (burst, generator)."""
+    gen = torch.Generator().manual_seed(seed)
+    scene = make_scene(size + n * step, gen, mean_level)
+    burst = torch.stack([scene[:, i * step:i * step + size, i * step:i * step + size] for i in range(n)])
+    burst = burst + torch.randn(burst.shape, generator=gen) * (burst * SHOT_NOISE).sqrt()
+    return burst.clamp(0.0, 1.0), gen
+
+
+MIDDLE = (6, 7)  # the most central frames of a 14-frame drifting burst
+
+
+class TestSelection(unittest.TestCase):
+    """The current rule: most central, exposure-consistent frame among the healthy ones."""
+
+    def test_clean_drifting_burst_picks_the_middle(self):
+        for seed in range(4):
+            burst, _ = make_drifting_burst(seed=seed)
+            # Centrality alone finds the exact middle; the brightness term (crops of the scene differ by ~1%) may
+            # move the pick to a neighbour, but never out of the central band
+            self.assertIn(alg2.select_reference_frame(burst, brightness_weight=0), MIDDLE, f'seed {seed}')
+            self.assertIn(alg2.select_reference_frame(burst), range(5, 9), f'seed {seed}')
+
+    def test_centrality_follows_the_motion(self):
+        # Frames 0-9 hold still and frames 10-13 jump away: the centre of the burst moves to the still frames
+        burst, _ = make_drifting_burst(seed=1, step=0)
+        moved, _ = make_drifting_burst(seed=1, step=6)
+        burst[10:] = moved[10:]
+        self.assertLess(alg2.select_reference_frame(burst), 10)
+
+    def test_damaged_frames_are_never_picked(self):
+        damages = {
+            'blur 1': lambda f, g: blur(f, 1.0),
+            'blur 2': lambda f, g: blur(f, 2.0),
+            'noise 3e-3': lambda f, g: add_noise(f, 3e-3, g),
+            'noise 1e-2': lambda f, g: add_noise(f, 1e-2, g),
+            'under x0.25': lambda f, g: expose(f, 0.25, g),
+            'over x2': lambda f, g: expose(f, 2.0, g),
+        }
+        for name, damage in damages.items():
+            burst, gen = make_drifting_burst(seed=3)
+            for k in MIDDLE:  # damage both central frames, so the rule must look elsewhere
+                burst[k] = damage(burst[k], gen)
+            ref = alg2.select_reference_frame(burst)
+            self.assertNotIn(ref, MIDDLE, f'{name}: picked a damaged frame')
+            self.assertIn(ref, (4, 5, 8, 9), f'{name}: should take the next most central healthy frame, got {ref}')
+
+    def test_clipped_frame_is_never_picked(self):
+        burst, gen = make_drifting_burst(seed=6, mean_level=0.15)
+        for k in MIDDLE:
+            burst[k] = expose(burst[k], 8.0, gen)
+        self.assertNotIn(alg2.select_reference_frame(burst), MIDDLE)
+
+    def test_features_do_not_depend_on_the_scene_level(self):
+        burst, _ = make_drifting_burst(seed=2)
+        clean, scaled = alg2.frame_features(burst), alg2.frame_features(burst * 2)
+        for key in clean:
+            np.testing.assert_allclose(scaled[key], clean[key], rtol=1e-3, atol=1e-6, err_msg=key)
+
+    def test_choose_from_features_rule(self):
+        f = {'centrality': np.array([5.0, 3.0, 2.0, 3.0, 5.0]),
+             'brightness': np.zeros(5),
+             'consistency': np.ones(5)}
+        self.assertEqual(alg2.choose_from_features(f), 2)                       # most central
+        f['consistency'] = np.array([1.0, 1.0, 2.0, 1.0, 1.0])
+        self.assertEqual(alg2.choose_from_features(f), 1)                       # 2 fails the gate; tie -> earlier
+        self.assertEqual(alg2.choose_from_features(f, margin=1.5), 2)           # a looser gate lets it through
+        f = {'centrality': np.array([3.0, 2.0, 2.1, 3.0]),
+             'brightness': np.array([0.0, 0.3, 0.0, 0.0]),
+             'consistency': np.ones(4)}
+        self.assertEqual(alg2.choose_from_features(f), 2)                       # brightness outlier loses
+        self.assertEqual(alg2.choose_from_features(f, brightness_weight=0), 1)  # centrality alone
+
+    def test_interface(self):
+        burst, _ = make_drifting_burst(n=8)
+        ref = alg2.select_reference_frame(burst[None])  # [1, N, 4, H, W] as in the evaluation scripts
+        self.assertIsInstance(ref, int)
+        self.assertTrue(0 <= ref < 8)
+        self.assertEqual(alg2.select_reference_frame(burst[:1]), 0)
+        self.assertIn(alg2.select_reference_frame(burst[:2]), (0, 1))
+        array = burst.numpy().copy()
+        self.assertEqual(alg2.select_reference_frame(array), alg2.select_reference_frame(burst))
+        np.testing.assert_array_equal(array, burst.numpy())  # numpy input is left unchanged
+        for bad in (torch.zeros(0, 4, 16, 16), torch.zeros(3, 3, 16, 16), torch.zeros(4, 16, 16),
+                    torch.zeros(2, 3, 4, 8, 8)):
+            with self.assertRaises(ValueError):
+                alg2.select_reference_frame(bad)
+        damaged = burst.clone()
+        damaged[2, 1, 5, 5] = float('nan')
+        with self.assertRaises(ValueError):
+            alg2.select_reference_frame(damaged)
+
+
 class TestAlignment(unittest.TestCase):
     def test_phase_correlation_recovers_shift_and_aligns(self):
         gen = torch.Generator().manual_seed(1)
@@ -80,7 +174,7 @@ class TestAlignment(unittest.TestCase):
         self.assertLess(err.item(), 0.05)
 
 
-class TestCost(unittest.TestCase):
+class TestCostV1(unittest.TestCase):
     def test_brightness_difference_raises_the_cost(self):
         burst, _ = make_burst(seed=2)
         clean = alg2.frame_costs(burst)
@@ -100,45 +194,47 @@ class TestCost(unittest.TestCase):
             self.assertAlmostEqual(scaled[c], clean[c], delta=1e-4 * clean[c])
 
 
-class TestSelection(unittest.TestCase):
+class TestSelectionV1(unittest.TestCase):
+    """The first version (keep frame 0 unless it looks damaged)."""
+
     def assert_switches(self, burst: torch.Tensor, msg: str, avoid=(0,)):
-        ref = alg2.select_reference_frame(burst)
+        ref = alg2.select_reference_frame_v1(burst)
         self.assertNotIn(ref, avoid, f'{msg}: kept frame {ref}, costs {alg2.frame_costs(burst)}')
         self.assertLess(ref, alg2.WINDOW)
 
     def test_clean_bursts_keep_default(self):
         for seed in range(6):
             burst, _ = make_burst(seed=seed)
-            self.assertEqual(alg2.select_reference_frame(burst), alg2.DEFAULT_REF,
+            self.assertEqual(alg2.select_reference_frame_v1(burst), alg2.DEFAULT_REF,
                              f'seed {seed}: costs {alg2.frame_costs(burst)}')
 
     def test_interface(self):
         burst, _ = make_burst(n=8)
-        ref = alg2.select_reference_frame(burst[None])  # [1, N, 4, H, W] as in the evaluation scripts
+        ref = alg2.select_reference_frame_v1(burst[None])  # [1, N, 4, H, W] as in the evaluation scripts
         self.assertIsInstance(ref, int)
         self.assertTrue(0 <= ref < 8)
-        self.assertEqual(alg2.select_reference_frame(burst[:1]), 0)
-        self.assertEqual(alg2.select_reference_frame(burst[:3]), alg2.select_reference_frame(burst[:3]))
+        self.assertEqual(alg2.select_reference_frame_v1(burst[:1]), 0)
+        self.assertEqual(alg2.select_reference_frame_v1(burst[:3]), alg2.select_reference_frame_v1(burst[:3]))
         with self.assertRaises(ValueError):
-            alg2.select_reference_frame(torch.zeros(2, 3, 4, 8, 8))
+            alg2.select_reference_frame_v1(torch.zeros(2, 3, 4, 8, 8))
 
     def test_same_interface_as_algorithm1(self):
         # Same inputs, outputs and errors as algorithm1.select_reference_frame
         burst, gen = make_burst(seed=4)
         burst[0] = add_noise(burst[0], 1e-2, gen)  # so the answer is not just the default frame
-        ref = alg2.select_reference_frame(burst)
+        ref = alg2.select_reference_frame_v1(burst)
         self.assertIsInstance(ref, int)
         array = burst.numpy().copy()
-        self.assertEqual(alg2.select_reference_frame(array), ref)  # numpy input gives the same answer
+        self.assertEqual(alg2.select_reference_frame_v1(array), ref)  # numpy input gives the same answer
         np.testing.assert_array_equal(array, burst.numpy())       # and is left unchanged
         for bad in (torch.zeros(0, 4, 16, 16), torch.zeros(3, 3, 16, 16), torch.zeros(4, 16, 16)):
             with self.assertRaises(ValueError):
-                alg2.select_reference_frame(bad)
+                alg2.select_reference_frame_v1(bad)
         for value in (float('nan'), float('inf')):
             damaged = burst.clone()
             damaged[2, 1, 5, 5] = value
             with self.assertRaises(ValueError):
-                alg2.select_reference_frame(damaged)
+                alg2.select_reference_frame_v1(damaged)
 
     def test_blurred_default_is_replaced(self):
         for sigma in (1.0, 2.0):
@@ -178,13 +274,13 @@ class TestSelection(unittest.TestCase):
         # A damaged non-default frame alone does not cause a switch
         burst, gen = make_burst(seed=8)
         burst[2] = expose(burst[2], 0.125, gen)
-        self.assertEqual(alg2.select_reference_frame(burst), 0)
+        self.assertEqual(alg2.select_reference_frame_v1(burst), 0)
 
     def test_fallback_is_the_earliest_acceptable_frame(self):
         for seed in range(3):
             burst, gen = make_burst(seed=20 + seed)
             burst[0] = add_noise(burst[0], 1e-2, gen)
-            self.assertEqual(alg2.select_reference_frame(burst), 1, f'seed {seed}: costs {alg2.frame_costs(burst)}')
+            self.assertEqual(alg2.select_reference_frame_v1(burst), 1, f'seed {seed}: costs {alg2.frame_costs(burst)}')
 
     def test_choose_from_costs_rule(self):
         self.assertEqual(alg2.choose_from_costs({0: 1.10, 1: 1.0, 2: 1.0, 3: 0.9}, margin=0.15), 0)

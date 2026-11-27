@@ -161,8 +161,9 @@ def main() -> None:
     parser.add_argument('--ref_policy', default='frame0', choices=REF_POLICIES,
                         help='How the reference frame is chosen, from the degraded burst (default: frame 0)')
     parser.add_argument('--guard_margin', default=None, type=float,
-                        help='Margin of the guarded or algorithm2 policy: how abnormal the default frame must be before it '
-                             f'is replaced (default: each policy has its own; {GUARD_MARGIN} for guarded)')
+                        help='Margin of the guarded policy (how abnormal the default frame must be before it is '
+                             "replaced) or of algorithm2's health gate (how abnormal a frame must be before it is "
+                             f'excluded). Default: each policy has its own; {GUARD_MARGIN} for guarded')
     args = parser.parse_args()
     if args.degrade_frames is not None and args.degradation not in SELECTIVE:
         parser.error(f'--degrade_frames only applies to the {", ".join(SELECTIVE)} degradations')

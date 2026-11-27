@@ -1,45 +1,49 @@
-"""Algorithm 2: exposure-aware consistency selection of the reference frame.
+"""
+Algorithm 2: Central, Exposure-Consistent Reference Selection.
 
-Shared interface (ALGORITHMS.md): a burst of N frames in, the index of the reference frame out, using the burst alone.
+Goal:
+    Pick the frame of the burst that Burstormer should use as its reference
+    (the frame it aligns everything else to). Uses the input burst only.
 
-Idea
-    Burstormer reconstructs the scene as seen by its reference frame, so a damaged reference (wrongly exposed, noisy,
-    blurred) costs far more than any other damaged frame. Every frame of a burst sees the same scene, so a good
-    reference is one that the rest of the burst agrees with, in detail and in brightness. Each candidate frame c is
-    compared with the frames that follow it (j = c+1 ... c+8), each aligned to c by a global translation (phase
-    correlation, sub-pixel Fourier shift), on the pixels they share:
+Step 1 - Centrality (how close is each frame to all the others?):
+    Measure how far each frame is shifted from every other frame (phase
+    correlation on the green channel). A frame in the middle of the burst's
+    motion has the least to align, so a smaller average shift is better.
 
-        cost(c) = median over j of mean|c - j|  /  typical brightness of the frames j
+Step 2 - Brightness agreement (does the frame match the rest of the burst?):
+    Compare each frame's brightness with the burst's median brightness.
+    A reference brighter or darker than the others hurts Burstormer, so a
+    smaller difference is better (exposure normalisation, Buades et al.).
 
-    - A noisy, blurred, clipped or misaligned frame disagrees with the others in detail. Unlike a sharpness score,
-      noise can only raise the cost.
-    - A frame brighter or darker than the rest of the burst disagrees in level: a frame 2x too bright or too dark
-      adds about 1 or 0.5 to its cost, while healthy frames of clean val bursts cost 0.06 (median; at most 0.18).
-      Burstormer is hurt by such a reference even without extra noise or clipping: on 12 dev bursts a reference
-      twice as bright as the others cost 4 dB. The natural brightness spread within a BurstSR burst is about 4%.
-    - Dividing by the typical brightness of the burst is the exposure normalisation of Buades et al. (2022,
-      Sec. 3.2), done without exposure times. It makes the cost independent of the scene's overall level. The
-      brightness is measured on the shared pixels, so content moving into or out of the frame does not count.
+Step 3 - Health check (is the frame damaged?):
+    Align each frame to its 4 nearest frames in time and measure how much
+    it differs from them. Noise, blur, bad exposure and clipping all make a
+    frame disagree with its neighbours. A frame more than 30% worse than the
+    burst's typical frame is never chosen.
 
-    Three choices were tested and dropped (docs/ALGORITHM2.md):
-    - Normalising each frame by its own brightness, plus a separate brightness-mismatch term,
-      cost = residual * (1 + |median log(brightness c / brightness j)|): it picked the same frame as this single
-      cost in all 440 clean and damaged val cases tested, with two terms instead of one.
-    - Comparing with the whole burst instead of the following frames favoured frames near the middle of the burst,
-      because frames further apart in time differ more after alignment.
-    - The well-exposedness weight of Buades et al. (2022, Sec. 4), w(x) = 1 - (2x - 1)^12, rewards brighter frames
-      in BurstSR's dark scenes. It therefore preferred an over-exposed reference that the model handles badly.
+Step 4 - Choose:
+    score = centrality + 0.5 x brightness difference (each standardised
+    over the burst). The healthy frame with the lowest score is returned.
 
-Selection rule (guarded)
-    - Only the first `window` frames are candidates: on BurstSR the best reference is always one of the first five,
-      and quality falls with frame index (docs/PLAN.md, Track A).
-    - The default frame is kept unless its cost is more than `margin` above the median cost of the other candidates.
-      On clean bursts the early frames are about equally good, so switching would only add risk.
-    - When the default is rejected, the earliest candidate whose cost is within `margin` of that median is used,
-      not the cheapest one: among acceptable frames, earlier ones are better references.
+Why not just frame 0:
+    Once the metric's penalty for a moved reference is removed (shift
+    control), frame 0 is on average the worst reference: it sits at the edge
+    of the burst. Middle frames are the best. On 40 test bursts this rule
+    gains +0.13 dB PSNR over frame 0, and improves SSIM and LPIPS too.
 
-Reference: A. Buades, O. Martorell, M. Sanchez-Beeckman, "Joint denoising and HDR for RAW video sequences",
-arXiv:2201.07066, 2022.
+IMPORTANT:
+    Ground truth is never used to choose the frame. Image-quality scores
+    (sharpness, algorithm 1's Q score, noise) did not predict the best
+    frame, so they are not part of the score. Results: docs/ALGORITHM2.md.
+
+The first version (keep frame 0 unless it looks damaged) is kept at the
+bottom of this file as select_reference_frame_v1, for comparison.
+
+References:
+    A. Buades, O. Martorell, M. Sanchez-Beeckman, "Joint denoising and HDR
+    for RAW video sequences", arXiv:2201.07066, 2022.
+    S. W. Hasinoff et al., "Burst photography for high dynamic range and
+    low-light imaging on mobile cameras", SIGGRAPH Asia 2016.
 """
 
 import math
@@ -48,10 +52,18 @@ from typing import Dict
 import numpy as np
 import torch
 
+# Current rule
+BRIGHTNESS_WEIGHT = 0.5  # chosen on 40 dev bursts with shift-control labels (0.25 and 0.5 tied, best of 0-2)
+BRIGHTNESS_FLOOR = 0.01  # brightness spreads below 1% are noise: never standardise them up to the motion's scale
+HEALTH_MARGIN = 0.3      # never pick a frame whose consistency cost is >30% above the burst median
+NEAREST = 4              # the health gate compares each frame with this many temporal neighbours
+
+# First version (select_reference_frame_v1)
 DEFAULT_REF = 0
 WINDOW = 5
 NEIGHBOURS = 8  # each candidate is compared with this many frames that follow it
 MARGIN = 0.2    # chosen on clean dev bursts (score_ref_policies.py)
+
 _EPS = 1e-6
 
 
@@ -112,6 +124,80 @@ def _fourier_shift(images: torch.Tensor, shifts: torch.Tensor) -> torch.Tensor:
     return torch.fft.ifft2(torch.fft.fft2(images) * ramp).real
 
 
+def _aligned_residuals(green: torch.Tensor, c: int, shifts: torch.Tensor, others: list) -> torch.Tensor:
+    """mean|c - j| for each j in `others`, after aligning them to c, on the shared pixels, divided by the typical
+    brightness of the frames j there (one scale for c and all of them, so a brightness difference stays in the
+    residual)."""
+    _, h, w = green.shape
+    aligned = _fourier_shift(green, shifts)
+    # Shared pixels: drop the wrapped-around border, keeping at least the central half of the image
+    border = min(int(math.ceil(shifts[others + [c]].abs().max().item())) + 1, min(h, w) // 4)
+    a = aligned[:, border:h - border, border:w - border]
+    typical = a[others].mean(dim=(1, 2)).clamp(min=_EPS).median()
+    return (a[others] - a[c:c + 1]).abs().flatten(1).mean(dim=1) / typical
+
+
+def _standardise(x: np.ndarray, floor: float = 0.0) -> np.ndarray:
+    return (x - x.mean()) / max(x.std(), floor, 1e-9)
+
+
+def frame_features(burst, nearest: int = NEAREST) -> Dict[str, np.ndarray]:
+    """Per-frame features of a burst (N, 4, H, W), each an array of N values:
+        centrality   mean translation (px) from the frame to every other frame
+        brightness   |log(brightness / burst median brightness)|
+        consistency  median aligned residual against the `nearest` temporal neighbours, exposure-normalised
+    """
+    frames = _as_frames(burst)
+    n = frames.shape[0]
+    if n < 2:
+        raise ValueError('Needs at least two frames')
+    green = frames[:, 1:3].mean(dim=1)  # [N, H, W], best-sampled colour
+    level = green.mean(dim=(1, 2)).clamp(min=_EPS)
+    centrality, consistency = np.zeros(n), np.zeros(n)
+    for c in range(n):
+        # Step 1: average shift from frame c to every other frame
+        shifts = _phase_shifts(green, c)
+        centrality[c] = shifts.norm(dim=1).sum().item() / (n - 1)
+        # Step 3: how much frame c disagrees with its nearest frames in time, once aligned
+        near = sorted((j for j in range(n) if j != c), key=lambda j: (abs(j - c), j))[:min(nearest, n - 1)]
+        consistency[c] = _aligned_residuals(green, c, shifts, near).median().item()
+    # Step 2: how far each frame's brightness is from the burst's median brightness
+    brightness = (level / level.median()).log().abs().numpy().astype(np.float64)
+    return {'centrality': centrality, 'brightness': brightness, 'consistency': consistency}
+
+
+def choose_from_features(features: Dict[str, np.ndarray], brightness_weight: float = BRIGHTNESS_WEIGHT,
+                         margin: float = HEALTH_MARGIN) -> int:
+    """The selection rule on precomputed features: the lowest score among the frames that pass the health gate."""
+    # Step 4: lower score = more central and closer to the burst's brightness
+    score = (_standardise(features['centrality'])
+             + brightness_weight * _standardise(features['brightness'], floor=BRIGHTNESS_FLOOR))
+    # Step 3: drop damaged frames (never empty: at least half the frames are at or below the median)
+    cost = features['consistency']
+    healthy = cost <= (1.0 + margin) * np.median(cost)
+    # The healthy frame with the lowest score is the reference
+    return int(np.where(healthy, score, np.inf).argmin())
+
+
+@torch.no_grad()
+def select_reference_frame(burst, brightness_weight: float = BRIGHTNESS_WEIGHT, margin: float = HEALTH_MARGIN) -> int:
+    """Select the reference frame of an input burst of shape (N, 4, H, W) (torch tensor or numpy array, packed RGGB
+    in [0, 1]); (1, N, 4, H, W) is also accepted. Same interface as algorithm1.select_reference_frame: returns the
+    frame index as a Python int in [0, N-1]. The keyword arguments are for the evaluation sweeps only."""
+    frames = _as_frames(burst)
+    if frames.shape[0] == 1:
+        return 0
+    return choose_from_features(frame_features(frames), brightness_weight=brightness_weight, margin=margin)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# First version, kept for comparison (score_ref_policies.py, docs/ALGORITHM2.md): keep frame 0 unless its cost
+#
+#     cost(c) = median over the NEIGHBOURS frames j after c of mean|c - j|  /  typical brightness of the frames j
+#
+# is more than MARGIN above the median cost of frames 1..WINDOW-1; then take the earliest frame within MARGIN.
+# ---------------------------------------------------------------------------------------------------------------
+
 def _comparison_frames(c: int, n: int, candidates: list, neighbours: int) -> list:
     """Frames that candidate c is compared with: the `neighbours` frames after it, fewer if the burst is short, so
     that every candidate sees the same time gaps. A candidate with no later frame falls back to all other frames."""
@@ -121,32 +207,23 @@ def _comparison_frames(c: int, n: int, candidates: list, neighbours: int) -> lis
 
 
 def frame_costs(burst, window: int = WINDOW, neighbours: int = NEIGHBOURS) -> Dict[int, float]:
-    """Cost of each of the first `window` frames as defined in the module docstring. Lower is better."""
+    """First version: cost of each of the first `window` frames. Lower is better."""
     frames = _as_frames(burst)
-    n, _, h, w = frames.shape
+    n = frames.shape[0]
     if n < 2:
         raise ValueError('Needs at least two frames')
     candidates = list(range(min(window, n)))
-    green = frames[:, 1:3].mean(dim=1)  # [N, H, W], best-sampled colour
-
+    green = frames[:, 1:3].mean(dim=1)
     costs = {}
     for c in candidates:
         others = _comparison_frames(c, n, candidates, neighbours)
-        shifts = _phase_shifts(green, c)
-        aligned = _fourier_shift(green, shifts)
-        # Shared pixels: drop the wrapped-around border, keeping at least the central half of the image
-        border = min(int(math.ceil(shifts[others + [c]].abs().max().item())) + 1, min(h, w) // 4)
-        a = aligned[:, border:h - border, border:w - border]
-        # Typical brightness of the comparison frames on the shared pixels: one scale for c and all of them, so a
-        # brightness difference stays in the residual
-        typical = a[others].mean(dim=(1, 2)).clamp(min=_EPS).median()
-        costs[c] = ((a[others] - a[c:c + 1]).abs().flatten(1).mean(dim=1).median() / typical).item()
+        costs[c] = _aligned_residuals(green, c, _phase_shifts(green, c), others).median().item()
     return costs
 
 
 def choose_from_costs(costs: Dict[int, float], default: int = DEFAULT_REF, margin: float = MARGIN) -> int:
-    """The guarded rule on precomputed costs: keep `default` unless its cost is more than `margin` above the median
-    cost of the other candidates; then take the earliest candidate within `margin` of that median."""
+    """First version's guarded rule on precomputed costs: keep `default` unless its cost is more than `margin` above
+    the median cost of the other candidates; then take the earliest candidate within `margin` of that median."""
     if default not in costs:
         raise ValueError(f'Default frame {default} is not among the candidates {sorted(costs)}')
     others = sorted(c for c in costs if c != default)
@@ -163,10 +240,9 @@ def choose_from_costs(costs: Dict[int, float], default: int = DEFAULT_REF, margi
 
 
 @torch.no_grad()
-def select_reference_frame(burst, default: int = DEFAULT_REF, window: int = WINDOW, margin: float = MARGIN) -> int:
-    """Select the reference frame of an input burst of shape (N, 4, H, W) (torch tensor or numpy array, packed RGGB
-    in [0, 1]); (1, N, 4, H, W) is also accepted. Same interface as algorithm1.select_reference_frame: returns the
-    frame index as a Python int in [0, N-1]. The keyword arguments are for the evaluation sweeps only."""
+def select_reference_frame_v1(burst, default: int = DEFAULT_REF, window: int = WINDOW, margin: float = MARGIN) -> int:
+    """First version of algorithm 2 (keep frame 0 unless it looks damaged). Same interface as
+    select_reference_frame."""
     frames = _as_frames(burst)
     if frames.shape[0] == 1:
         return 0
